@@ -115,6 +115,8 @@ pub enum ValidationError {
     TransformFailed,
     /// Message size was too large for topic
     MessageSizeTooLargeForTopic,
+    /// A large message could not be reassembled from its fragments.
+    MessageReassemblyFailed,
 }
 
 impl std::fmt::Display for ValidationError {
@@ -146,6 +148,12 @@ pub enum ConfigBuilderError {
     UnsubscribeBackoffIsZero,
     /// Invalid protocol
     InvalidProtocol,
+    /// A fragment RPC does not fit within the maximum transmission size
+    FragmentSizeTooLarge,
+    /// The large message handling parameters are inconsistent
+    LargeMessageParametersInvalid,
+    /// The total reassembly memory cannot cover the mesh's per peer budgets
+    ReassemblyMemoryTooSmall,
 }
 
 impl std::error::Error for ConfigBuilderError {}
@@ -169,6 +177,17 @@ impl std::fmt::Display for ConfigBuilderError {
             ),
             Self::UnsubscribeBackoffIsZero => write!(f, "unsubscribe_backoff is zero"),
             Self::InvalidProtocol => write!(f, "Invalid protocol"),
+            Self::FragmentSizeTooLarge => write!(
+                f,
+                "A fragment RPC does not fit within the maximum transmission size"
+            ),
+            Self::LargeMessageParametersInvalid => {
+                write!(f, "The large message handling parameters are inconsistent")
+            }
+            Self::ReassemblyMemoryTooSmall => write!(
+                f,
+                "The total reassembly memory cannot cover the mesh's per peer budgets"
+            ),
         }
     }
 }

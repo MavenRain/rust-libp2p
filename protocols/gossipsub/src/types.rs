@@ -101,6 +101,15 @@ pub(crate) struct PeerDetails {
     pub(crate) topics: BTreeSet<TopicHash>,
     /// Don't send messages.
     pub(crate) dont_send: LinkedHashMap<MessageId, Instant>,
+    /// Message ids this peer told us it is currently receiving (gossipsub v1.4 IMRECEIVING).
+    /// Separate from `dont_send` because these entries live for `fragment_timeout`,
+    /// not `IDONTWANT_TIMEOUT`.
+    pub(crate) imreceiving: LinkedHashMap<MessageId, Instant>,
+    /// Message ids for which the pipelined relay has already sent this peer every
+    /// fragment. `forward_msg` must not send those messages again: the relay path
+    /// and the post-reassembly forward path both target the same mesh, so without
+    /// this the mesh gets every large message twice.
+    pub(crate) fragments_relayed: LinkedHashMap<MessageId, Instant>,
     /// Message queue consumed by the connection handler.
     pub(crate) messages: Queue,
 }
@@ -405,6 +414,16 @@ pub enum RpcOut {
     IDontWant(IDontWant),
     /// Send a Extensions control message.
     Extensions(Extensions),
+    /// Send a PREAMBLE control message announcing a large message.
+    Preamble(Preamble),
+    /// Send an IMRECEIVING control message signalling an in-progress download.
+    ImReceiving(ImReceiving),
+    /// Send one fragment of a large message. `timeout` limits the duration the
+    /// fragment can wait to be sent before it is abandoned.
+    LargeMessageFragment {
+        fragment: LargeMessageFragment,
+        timeout: Delay,
+    },
     /// Send a test extension message.
     TestExtension,
     /// Send a partial messages extension.
@@ -429,6 +448,8 @@ impl RpcOut {
                 | RpcOut::Graft(_)
                 | RpcOut::Prune(_)
                 | RpcOut::IDontWant(_)
+                | RpcOut::Preamble(_)
+                | RpcOut::ImReceiving(_)
         )
     }
 }
@@ -619,6 +640,61 @@ impl From<RpcOut> for proto::Rpc {
                 }),
                 partial: None,
                 large_message_fragments: vec![],
+            },
+            RpcOut::Preamble(Preamble {
+                message_id,
+                message_size,
+                topic_hash,
+            }) => proto::Rpc {
+                publish: Vec::new(),
+                subscriptions: Vec::new(),
+                control: Some(proto::ControlMessage {
+                    ihave: vec![],
+                    iwant: vec![],
+                    graft: vec![],
+                    prune: vec![],
+                    idontwant: vec![],
+                    extensions: None,
+                    preamble: vec![proto::ControlPreamble {
+                        message_id: Some(message_id.0),
+                        message_size: Some(message_size),
+                        topic_id: Some(topic_hash.into_string()),
+                    }],
+                    imreceiving: vec![],
+                }),
+                partial: None,
+                large_message_fragments: vec![],
+            },
+            RpcOut::ImReceiving(ImReceiving { message_id }) => proto::Rpc {
+                publish: Vec::new(),
+                subscriptions: Vec::new(),
+                control: Some(proto::ControlMessage {
+                    ihave: vec![],
+                    iwant: vec![],
+                    graft: vec![],
+                    prune: vec![],
+                    idontwant: vec![],
+                    extensions: None,
+                    preamble: vec![],
+                    imreceiving: vec![proto::ControlImReceiving {
+                        message_id: Some(message_id.0),
+                    }],
+                }),
+                partial: None,
+                large_message_fragments: vec![],
+            },
+            RpcOut::LargeMessageFragment { fragment, .. } => proto::Rpc {
+                publish: Vec::new(),
+                subscriptions: Vec::new(),
+                control: None,
+                partial: None,
+                large_message_fragments: vec![proto::LargeMessageFragment {
+                    message_id: Some(fragment.message_id.0),
+                    fragment_index: Some(fragment.fragment_index),
+                    total_fragments: Some(fragment.total_fragments),
+                    fragment_data: Some(fragment.fragment_data),
+                    topic_id: Some(fragment.topic_hash.into_string()),
+                }],
             },
             RpcOut::TestExtension => proto::Rpc {
                 subscriptions: vec![],

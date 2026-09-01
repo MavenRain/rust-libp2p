@@ -218,6 +218,65 @@ fn parses_idontwant() {
     assert!(peer.dont_send.get(&message_id).is_some());
 }
 
+/// Test that an incoming IDONTWANT purges queued large message fragments
+/// for the announced message ids.
+#[test]
+fn test_idontwant_removes_queued_fragments() {
+    use std::time::Duration;
+
+    use futures_timer::Delay;
+
+    use crate::types::LargeMessageFragment;
+
+    let (mut gs, peers, _queues, topic_hashes) = DefaultBehaviourTestBuilder::default()
+        .peer_no(2)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(Config::default())
+        .explicit(1)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+
+    let message_id = MessageId::new(&[0, 1, 2, 3]);
+    // Queue a fragment of the message for the peer.
+    let peer = gs.connected_peers.get_mut(&peers[1]).unwrap();
+    peer.messages
+        .try_push(RpcOut::LargeMessageFragment {
+            fragment: LargeMessageFragment {
+                message_id: message_id.clone(),
+                fragment_index: 0,
+                total_fragments: 2,
+                fragment_data: vec![1u8; 64],
+                topic_hash: topic_hashes[0].clone(),
+            },
+            timeout: Delay::new(Duration::from_secs(5)),
+        })
+        .unwrap();
+    assert!(!peer.messages.fragments.is_empty());
+
+    let rpc = RpcIn {
+        messages: vec![],
+        subscriptions: vec![],
+        large_message_fragments: vec![],
+        #[cfg(feature = "partial-messages")]
+        partial_message: None,
+        control_msgs: vec![ControlAction::IDontWant(IDontWant {
+            message_ids: vec![message_id],
+        })],
+    };
+    gs.on_connection_handler_event(
+        peers[1],
+        ConnectionId::new_unchecked(0),
+        HandlerEvent::Message {
+            rpc,
+            invalid_messages: vec![],
+        },
+    );
+
+    let peer = gs.connected_peers.get(&peers[1]).unwrap();
+    assert!(peer.messages.fragments.is_empty());
+}
+
 /// Test that a node clears stale IDONTWANT messages.
 #[test]
 fn clear_stale_idontwant() {

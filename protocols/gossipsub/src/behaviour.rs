@@ -23,9 +23,10 @@ use std::{
         Ordering::{self, Equal},
         max,
     },
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     fmt::{self, Debug},
     net::IpAddr,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -48,16 +49,23 @@ use libp2p_swarm::{
 #[cfg(feature = "metrics")]
 use prometheus_client::registry::Registry;
 use prost::Message as _;
-use rand::seq::{IteratorRandom, SliceRandom};
+use rand::{
+    SeedableRng,
+    rngs::StdRng,
+    seq::{IteratorRandom, SliceRandom},
+};
 use web_time::{Instant, SystemTime};
 
 #[cfg(feature = "metrics")]
-use crate::metrics::{Churn, Config as MetricsConfig, Inclusion, Metrics, Penalty};
+use crate::metrics::{
+    Churn, Config as MetricsConfig, FragmentDrop, Inclusion, Metrics, Penalty, StaggerSkip,
+};
 use crate::{
     FailedMessages, MaxCountSubscriptionFilter, PublishError, SubscriptionError, TopicScoreParams,
     ValidationError,
     backoff::BackoffStorage,
     config::{Config, ValidationMode},
+    extensions::large_messages,
     gossip_promises::GossipPromises,
     handler::{Handler, HandlerEvent, HandlerIn},
     mcache::MessageCache,
@@ -70,9 +78,9 @@ use crate::{
     topic::{Hasher, Topic, TopicHash},
     transform::{DataTransform, IdentityTransform},
     types::{
-        ControlAction, Extensions, Graft, IDontWant, IHave, IWant, Message, MessageAcceptance,
-        MessageId, PeerDetails, PeerInfo, PeerKind, Prune, RawMessage, RpcOut, Subscription,
-        SubscriptionAction,
+        ControlAction, Extensions, Graft, IDontWant, IHave, IWant, ImReceiving,
+        LargeMessageFragment, Message, MessageAcceptance, MessageId, PeerDetails, PeerInfo,
+        PeerKind, Preamble, Prune, RawMessage, RpcOut, Subscription, SubscriptionAction,
     },
 };
 #[cfg(feature = "partial-messages")]
@@ -89,6 +97,12 @@ const IDONTWANT_CAP: usize = 10_000;
 
 /// IDONTWANT timeout before removal.
 const IDONTWANT_TIMEOUT: Duration = Duration::new(3, 0);
+
+/// Message ids a single peer may hold in `PeerDetails.imreceiving`.
+const IMRECEIVING_CAP: usize = 1_000;
+
+/// Message ids a single peer may hold in `PeerDetails.fragments_relayed`.
+const FRAGMENTS_RELAYED_CAP: usize = 1_000;
 
 /// Max allowed PRUNE backoff, 1 hour.
 const MAX_REMOTE_PRUNE_BACKOFF_SECONDS: u64 = 3600;
@@ -326,6 +340,9 @@ pub struct Behaviour<
     #[cfg(feature = "partial-messages")]
     partial_messages_extension: partial_messages::State,
 
+    /// Reassembly state for the gossipsub v1.4 Large Message Handling extension.
+    large_messages: large_messages::State,
+
     /// Map of topics to list of peers that we publish to, but don't subscribe to.
     fanout: HashMap<TopicHash, BTreeSet<PeerId>>,
 
@@ -340,6 +357,18 @@ pub struct Behaviour<
 
     /// Heartbeat interval stream.
     heartbeat: Delay,
+
+    /// Large-message sends deferred by `stagger_interval`, oldest due first.
+    stagger_queue: VecDeque<large_messages::StaggeredSend>,
+
+    /// Payloads for the messages in `stagger_queue`, one entry per message id.
+    stagger_payloads: HashMap<MessageId, large_messages::StaggeredMessage>,
+
+    /// Sum of `StaggeredMessage::bytes` across `stagger_payloads`.
+    stagger_bytes: usize,
+
+    /// Fires when the front of `stagger_queue` is due.
+    stagger_timer: Delay,
 
     /// Number of heartbeats since the beginning of time; this allows us to amortize some resource
     /// clean up -- eg backoff clean up.
@@ -478,6 +507,10 @@ where
             ),
             mcache: MessageCache::new(config.history_gossip(), config.history_length()),
             heartbeat: Delay::new(config.heartbeat_interval() + config.heartbeat_initial_delay()),
+            stagger_queue: VecDeque::new(),
+            stagger_payloads: HashMap::new(),
+            stagger_bytes: 0,
+            stagger_timer: Delay::new(Duration::ZERO),
             heartbeat_ticks: 0,
             px_peers: HashSet::new(),
             peer_score: PeerScoreState::Disabled,
@@ -491,6 +524,7 @@ where
             gossip_promises: Default::default(),
             #[cfg(feature = "partial-messages")]
             partial_messages_extension: Default::default(),
+            large_messages: Default::default(),
         })
     }
 
@@ -705,6 +739,8 @@ where
         self.gossip_promises.message_delivered(&msg_id);
 
         // Send to peers we know are subscribed to the topic.
+        let fragmenting = self.config.large_message_handling()
+            && raw_message.raw_protobuf_len() > self.config.fragmentation_threshold();
         let mut publish_failed = true;
         for peer_id in recipients.iter() {
             tracing::trace!(peer=%peer_id, "Sending message to peer");
@@ -721,16 +757,28 @@ where
                 );
             }
 
-            if self.send_message(
-                *peer_id,
-                RpcOut::Publish {
-                    message_id: msg_id.clone(),
-                    message: raw_message.clone(),
-                    timeout: Delay::new(self.config.publish_queue_duration()),
-                },
-            ) {
+            if !fragmenting
+                && self.send_message(
+                    *peer_id,
+                    RpcOut::Publish {
+                        message_id: msg_id.clone(),
+                        message: raw_message.clone(),
+                        timeout: Delay::new(self.config.publish_queue_duration()),
+                    },
+                )
+            {
                 publish_failed = false
             }
+        }
+
+        if fragmenting {
+            let recipient_list: Vec<PeerId> = recipients.iter().copied().collect();
+            publish_failed = !self.send_large_message(
+                &msg_id,
+                &raw_message,
+                &recipient_list,
+                self.config.publish_queue_duration(),
+            );
         }
 
         if publish_failed {
@@ -987,6 +1035,10 @@ where
             MessageAcceptance::Reject => RejectReason::ValidationFailed,
             MessageAcceptance::Ignore => RejectReason::ValidationIgnored,
         };
+
+        // A message the application rejected or ignored must not keep going
+        // out through the stagger queue.
+        self.cancel_staggered_sends(msg_id);
 
         if let Some((raw_message, originating_peers)) = self.mcache.remove(msg_id) {
             #[cfg(feature = "metrics")]
@@ -1396,7 +1448,12 @@ where
                     return false;
                 }
 
-                !self.gossip_promises.contains(id)
+                // A transfer for this id is in flight: defer the IWANT one
+                // heartbeat rather than pull a copy we are already receiving.
+                let receiving =
+                    self.config.large_message_handling() && self.large_messages.is_receiving(id);
+
+                !receiving && !self.gossip_promises.contains(id)
             }) {
                 // have not seen this message and are not currently requesting it
                 if iwant_ids.insert(id) {
@@ -1708,6 +1765,16 @@ where
         peer.extensions = Some(extensions);
     }
 
+    /// Whether the peer advertised support for the Large Message Handling
+    /// extension in its `Extensions` control message.
+    fn supports_large_messages(&self, peer_id: &PeerId) -> bool {
+        self.connected_peers
+            .get(peer_id)
+            .and_then(|peer| peer.extensions)
+            .and_then(|extensions| extensions.large_message_handling)
+            .unwrap_or(false)
+    }
+
     /// Removes the specified peer from the mesh, returning true if it was present.
     fn remove_peer_from_mesh(
         &mut self,
@@ -1913,6 +1980,237 @@ where
         }
 
         true
+    }
+
+    /// Reads the Large Message Handling bounds for one topic off the config.
+    fn large_message_limits(&self, topic_hash: &TopicHash) -> large_messages::Limits {
+        large_messages::Limits {
+            max_inbound_fragment_bytes: self
+                .config
+                .max_transmit_size()
+                .saturating_sub(large_messages::LARGE_FRAGMENT_RPC_OVERHEAD),
+            fragment_timeout: self.config.fragment_timeout(),
+            max_pending_fragments: self.config.max_pending_fragments(),
+            max_reassembly_bytes_per_peer: self.config.max_reassembly_bytes_per_peer(),
+            max_reassembly_bytes_total: self.config.max_reassembly_bytes_total(),
+            max_preamble_announcements_per_peer: self.config.max_preamble_announcements_per_peer(),
+            max_message_bytes: self.config.max_transmit_size_for_topic(topic_hash),
+            preamble_threshold: self.config.preamble_threshold(),
+        }
+    }
+
+    /// Maps a [`large_messages::Penalty`] onto the peer-scoring hooks.
+    fn apply_large_message_penalty(
+        &mut self,
+        peer_id: &PeerId,
+        topic_hash: &TopicHash,
+        penalty: large_messages::Penalty,
+    ) {
+        match penalty {
+            large_messages::Penalty::InvalidMessage(error) => {
+                #[cfg(feature = "metrics")]
+                if let Some(m) = self.metrics.as_mut() {
+                    m.register_fragments_dropped(FragmentDrop::Invalid, 1);
+                }
+                self.handle_invalid_message(
+                    peer_id,
+                    topic_hash,
+                    None,
+                    RejectReason::ValidationError(error),
+                );
+            }
+            large_messages::Penalty::Behavioural => {
+                if let PeerScoreState::Active(peer_score) = &mut self.peer_score {
+                    peer_score.add_penalty(peer_id, 1);
+                }
+            }
+        }
+    }
+
+    /// Relays one accepted fragment to the extension-capable members of the
+    /// fragment's topic mesh, minus the sender, after the admission checks the
+    /// state machine cannot take itself: the sender is a mesh member (a
+    /// non-mesh sender may reassemble but never relays), the sender's score is
+    /// at or above the gossip threshold, and we do not already hold the whole
+    /// message. Every send is recorded in the per-recipient relay ledger, so
+    /// no index reaches a recipient twice across senders and `forward_msg`
+    /// knows what to skip after reassembly.
+    fn relay_fragment(&mut self, propagation_source: &PeerId, fragment: LargeMessageFragment) {
+        let sender_in_mesh = self
+            .mesh
+            .get(&fragment.topic_hash)
+            .is_some_and(|peers| peers.contains(propagation_source));
+        let sender_below_threshold = self
+            .peer_score
+            .below_threshold(propagation_source, |ts| ts.gossip_threshold)
+            .0;
+        if sender_in_mesh
+            && !sender_below_threshold
+            && !self.duplicate_cache.contains(&fragment.message_id)
+        {
+            let recipients: Vec<PeerId> = self
+                .mesh
+                .get(&fragment.topic_hash)
+                .map(|peers| {
+                    peers
+                        .iter()
+                        .filter(|peer_id| {
+                            *peer_id != propagation_source
+                                && self.supports_large_messages(peer_id)
+                                && !self.large_messages.already_relayed(
+                                    &fragment.message_id,
+                                    peer_id,
+                                    fragment.fragment_index,
+                                )
+                        })
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default();
+            recipients.into_iter().for_each(|peer_id| {
+                let sent = self.send_message(
+                    peer_id,
+                    RpcOut::LargeMessageFragment {
+                        fragment: fragment.clone(),
+                        timeout: Delay::new(self.config.forward_queue_duration()),
+                    },
+                );
+                // Record only what actually reached the peer's queue: an
+                // over-recorded index would never be re-sent.
+                if sent {
+                    #[cfg(feature = "metrics")]
+                    if let Some(m) = self.metrics.as_mut() {
+                        m.register_fragment_relayed();
+                    }
+                    let completed = self.large_messages.record_relayed(
+                        &fragment.message_id,
+                        peer_id,
+                        fragment.fragment_index,
+                        fragment.total_fragments,
+                    );
+                    self.mark_fragments_relayed(&fragment.message_id, completed);
+                }
+            });
+        }
+    }
+
+    /// Marks `message_id` as fully relayed to each of `recipients`, the set
+    /// `forward_msg` skips. LRU-capped at [`FRAGMENTS_RELAYED_CAP`] per peer.
+    fn mark_fragments_relayed(&mut self, message_id: &MessageId, recipients: Vec<PeerId>) {
+        recipients.into_iter().for_each(|peer_id| {
+            if let Some(peer) = self.connected_peers.get_mut(&peer_id) {
+                peer.fragments_relayed
+                    .insert(message_id.clone(), Instant::now());
+                if peer.fragments_relayed.len() > FRAGMENTS_RELAYED_CAP {
+                    peer.fragments_relayed.pop_front();
+                }
+            }
+        });
+    }
+
+    /// Applies the actions a [`large_messages::State`] call reported back.
+    fn handle_large_message_actions(
+        &mut self,
+        propagation_source: &PeerId,
+        actions: Vec<large_messages::ReceivedAction>,
+    ) {
+        actions.into_iter().for_each(|action| match action {
+            large_messages::ReceivedAction::RelayFragment(fragment) => {
+                self.relay_fragment(propagation_source, fragment);
+            }
+            large_messages::ReceivedAction::AnnounceReceiving {
+                message_id,
+                topic_hash,
+            } => {
+                // IMRECEIVING goes to the capable mesh for the topic, except
+                // the peer whose transfer we are accepting: an IMRECEIVING
+                // asks its receiver to stop sending, and that is the one
+                // transfer we want to finish.
+                let recipients: Vec<PeerId> = self
+                    .mesh
+                    .get(&topic_hash)
+                    .map(|peers| {
+                        peers
+                            .iter()
+                            .filter(|peer_id| {
+                                *peer_id != propagation_source
+                                    && self.supports_large_messages(peer_id)
+                            })
+                            .copied()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                recipients.into_iter().for_each(|peer_id| {
+                    self.send_message(
+                        peer_id,
+                        RpcOut::ImReceiving(ImReceiving {
+                            message_id: message_id.clone(),
+                        }),
+                    );
+                });
+            }
+            large_messages::ReceivedAction::ReplyImReceiving {
+                peer_id,
+                message_id,
+            } => {
+                self.send_message(peer_id, RpcOut::ImReceiving(ImReceiving { message_id }));
+            }
+            large_messages::ReceivedAction::SuppressSender {
+                peer_id,
+                message_id,
+            } => {
+                self.send_message(
+                    peer_id,
+                    RpcOut::IDontWant(IDontWant {
+                        message_ids: vec![message_id],
+                    }),
+                );
+            }
+            large_messages::ReceivedAction::MessageReassembled {
+                announced_id,
+                message,
+            } => {
+                #[cfg(feature = "metrics")]
+                if let Some(m) = self.metrics.as_mut() {
+                    m.register_reassembly_completed();
+                }
+                // Check 8: bind the fragments' message id to the id recomputed
+                // from the reassembled bytes. Only the behaviour holds the data
+                // transform, so the verdict is taken here.
+                let computed_id = self
+                    .data_transform
+                    .inbound_transform(message.clone())
+                    .map(|transformed| self.config.message_id(&transformed))
+                    .ok();
+                if computed_id.is_some_and(|id| id != announced_id) {
+                    tracing::debug!(
+                        peer=%propagation_source,
+                        message=%announced_id,
+                        "Reassembled message id does not match the fragments' id"
+                    );
+                    let topic_hash = message.topic.clone();
+                    self.handle_invalid_message(
+                        propagation_source,
+                        &topic_hash,
+                        None,
+                        RejectReason::ValidationError(ValidationError::MessageReassemblyFailed),
+                    );
+                    self.large_messages
+                        .poison(propagation_source, announced_id, Instant::now());
+                } else {
+                    // Check 9: hand over to the existing pipeline. A transform
+                    // failure falls through to its invalid-message path.
+                    self.handle_received_message(message, propagation_source);
+                }
+            }
+            large_messages::ReceivedAction::PenalizePeer {
+                peer_id,
+                topic_hash,
+                penalty,
+            } => {
+                self.apply_large_message_penalty(&peer_id, &topic_hash, penalty);
+            }
+        });
     }
 
     /// Handles a newly received [`RawMessage`].
@@ -2740,7 +3038,10 @@ where
         }
         self.failed_messages.shrink_to_fit();
 
-        // Flush stale IDONTWANTs.
+        // Flush stale IDONTWANTs, IMRECEIVINGs and fully-relayed ids. The
+        // latter two live for `fragment_timeout`, not `IDONTWANT_TIMEOUT`: a
+        // large transfer outlives the 3 s IDONTWANT window by design.
+        let fragment_timeout = self.config.fragment_timeout();
         for peer in self.connected_peers.values_mut() {
             while let Some((_front, instant)) = peer.dont_send.front() {
                 if IDONTWANT_TIMEOUT >= Instant::now().saturating_duration_since(*instant) {
@@ -2749,6 +3050,43 @@ where
                     peer.dont_send.pop_front();
                 }
             }
+            peer.imreceiving.retain(|_, instant| {
+                fragment_timeout >= Instant::now().saturating_duration_since(*instant)
+            });
+            peer.fragments_relayed.retain(|_, instant| {
+                fragment_timeout >= Instant::now().saturating_duration_since(*instant)
+            });
+        }
+
+        // Sweep expired large-message reassembly state.
+        if self.config.large_message_handling() {
+            // The sweep reads only `fragment_timeout`; the topic argument merely
+            // resolves the per-topic message ceiling, unused here.
+            let limits = self.large_message_limits(&TopicHash::from_raw(""));
+            #[cfg(feature = "metrics")]
+            let reassemblies_before = self.large_messages.reassemblies_in_progress();
+            let actions = self.large_messages.heartbeat(&limits, Instant::now());
+            #[cfg(feature = "metrics")]
+            {
+                // Every reassembly buffer the sweep removes is a timeout.
+                let timed_out = reassemblies_before
+                    .saturating_sub(self.large_messages.reassemblies_in_progress());
+                let bytes_in_use = self.large_messages.reassembly_bytes_in_use();
+                if let Some(m) = self.metrics.as_mut() {
+                    m.register_reassemblies_timed_out(timed_out);
+                    m.set_reassembly_bytes_in_use(bytes_in_use);
+                }
+            }
+            actions.into_iter().for_each(|action| {
+                if let large_messages::ReceivedAction::PenalizePeer {
+                    peer_id,
+                    topic_hash,
+                    penalty,
+                } = action
+                {
+                    self.apply_large_message_penalty(&peer_id, &topic_hash, penalty);
+                }
+            });
         }
 
         #[cfg(feature = "partial-messages")]
@@ -3000,36 +3338,80 @@ where
             return false;
         }
 
-        // forward the message to peers
-        for peer_id in recipient_peers.iter() {
-            if let Some(peer) = self.connected_peers.get_mut(peer_id) {
-                if peer.dont_send.contains_key(msg_id) {
-                    tracing::debug!(%peer_id, message_id=%msg_id, "Peer doesn't want message");
-                    continue;
+        if self.config.large_message_handling()
+            && message.raw_protobuf_len() > self.config.fragmentation_threshold()
+        {
+            // The fragmenting path returns early, so this filter must mirror
+            // every per-peer skip the loop below performs. Standing rule for
+            // this file: any per-peer skip added to the `forward_msg` loop
+            // must be added to this filter in the same commit.
+            let recipients: Vec<PeerId> = recipient_peers
+                .iter()
+                .copied()
+                .filter(|peer_id| {
+                    // Mirrors the loop's existence guard: an unknown peer is
+                    // not a recipient.
+                    self.connected_peers.get(peer_id).is_some_and(|peer| {
+                        !peer.dont_send.contains_key(msg_id)
+                            && !peer.imreceiving.contains_key(msg_id)
+                            // Already got every fragment from the relay path.
+                            && !peer.fragments_relayed.contains_key(msg_id)
+                    })
+                })
+                .collect();
+
+            // Mirrors the loop's `requests_partial` skip. A peer that asked
+            // for partial delivery must not be handed a full fragmented copy
+            // instead.
+            #[cfg(feature = "partial-messages")]
+            let recipients: Vec<PeerId> = recipients
+                .into_iter()
+                .filter(|peer_id| {
+                    !self
+                        .partial_messages_extension
+                        .requests_partial(peer_id, topic)
+                })
+                .collect();
+
+            self.send_large_message(
+                msg_id,
+                &message,
+                &recipients,
+                self.config.forward_queue_duration(),
+            )
+        } else {
+            // forward the message to peers
+            for peer_id in recipient_peers.iter() {
+                if let Some(peer) = self.connected_peers.get_mut(peer_id) {
+                    if peer.dont_send.contains_key(msg_id) || peer.imreceiving.contains_key(msg_id)
+                    {
+                        tracing::debug!(%peer_id, message_id=%msg_id, "Peer doesn't want message");
+                        continue;
+                    }
+
+                    #[cfg(feature = "partial-messages")]
+                    if self
+                        .partial_messages_extension
+                        .requests_partial(peer_id, topic)
+                    {
+                        continue;
+                    }
+
+                    tracing::debug!(%peer_id, message_id=%msg_id, "Sending message to peer");
+
+                    self.send_message(
+                        *peer_id,
+                        RpcOut::Publish {
+                            message_id: msg_id.clone(),
+                            message: message.clone(),
+                            timeout: Delay::new(self.config.forward_queue_duration()),
+                        },
+                    );
                 }
-
-                #[cfg(feature = "partial-messages")]
-                if self
-                    .partial_messages_extension
-                    .requests_partial(peer_id, topic)
-                {
-                    continue;
-                }
-
-                tracing::debug!(%peer_id, message_id=%msg_id, "Sending message to peer");
-
-                self.send_message(
-                    *peer_id,
-                    RpcOut::Publish {
-                        message_id: msg_id.clone(),
-                        message: message.clone(),
-                        timeout: Delay::new(self.config.forward_queue_duration()),
-                    },
-                );
             }
+            tracing::debug!("Completed forwarding message");
+            true
         }
-        tracing::debug!("Completed forwarding message");
-        true
     }
 
     /// Constructs a [`RawMessage`] performing message signing if required.
@@ -3119,6 +3501,509 @@ where
         }
     }
 
+    /// Sends `message` to `recipients`, fragmenting it for peers that
+    /// advertised the v1.4 Large Message Handling extension and sending one
+    /// whole [`RpcOut::Publish`] to peers that did not.
+    ///
+    /// A capable peer whose fragment tier cannot take the whole fragment run is
+    /// dropped from the recipient set *before the first push* and receives
+    /// nothing at all, neither a PREAMBLE nor a fragment: a partial transfer
+    /// would hold the receiver's reassembly budget until its fragment timeout
+    /// and then earn us a behavioural penalty.
+    ///
+    /// Returns `true` if at least one peer received a message it can actually
+    /// use: a complete fragment run, or a whole [`RpcOut::Publish`] for a
+    /// legacy peer. A truncated send never counts.
+    fn send_large_message(
+        &mut self,
+        message_id: &MessageId,
+        message: &RawMessage,
+        recipients: &[PeerId],
+        queue_duration: Duration,
+    ) -> bool {
+        let (capable, legacy): (Vec<PeerId>, Vec<PeerId>) = recipients
+            .iter()
+            .copied()
+            .partition(|peer_id| self.supports_large_messages(peer_id));
+
+        // Fragment once, before any send: the pre-flight reservation below
+        // needs the fragment count.
+        let fragments_result =
+            large_messages::fragment_message(message_id, message, self.config.fragment_size());
+
+        // Stagger sends above the threshold, so an IDONTWANT or IMRECEIVING
+        // arriving during the window can suppress the later ones.
+        let staggering = self.config.stagger_interval() > Duration::ZERO
+            && message.raw_protobuf_len() >= self.config.stagger_threshold();
+
+        let capable_reached = fragments_result.map_or_else(
+            |_| {
+                // Unreachable with a built `Config`: `ConfigBuilder::build`
+                // keeps every topic ceiling within a whole fragment tier,
+                // far below `MAX_FRAGMENTS_HARD_CAP` fragments.
+                tracing::warn!(
+                    message=%message_id,
+                    "Message needs more fragments than the hard cap; not fragmenting"
+                );
+                0
+            },
+            |fragments| {
+                let total_fragments = fragments.len() as u32;
+                // What the pipelined relay has not already sent each peer. A
+                // peer with no ledger record needs the whole run; a peer the
+                // relay completed needs nothing and is skipped whole.
+                let missing: Vec<(PeerId, Vec<u32>)> = capable
+                    .into_iter()
+                    .map(|peer_id| {
+                        let indices = self.large_messages.missing_indices(
+                            message_id,
+                            &peer_id,
+                            total_fragments,
+                        );
+                        (peer_id, indices)
+                    })
+                    .filter(|(_, indices)| !indices.is_empty())
+                    .collect();
+
+                // Reserve, then send: a peer without room for its whole
+                // remaining run is skipped before anything is pushed to it.
+                let survivors: Vec<(PeerId, Vec<u32>)> = missing
+                    .into_iter()
+                    .filter(|(peer_id, indices)| {
+                        let has_room = self.connected_peers.get(peer_id).is_some_and(|peer| {
+                            peer.messages.fragments_remaining_capacity() >= indices.len()
+                        });
+                        if !has_room {
+                            tracing::debug!(
+                                peer=%peer_id,
+                                message=%message_id,
+                                "Peer queue cannot take the whole fragment run, skipping peer"
+                            );
+                        }
+                        has_room
+                    })
+                    .collect();
+
+                // The PREAMBLE announces the concatenated fragment bytes and
+                // precedes every fragment. A peer the relay already reached
+                // knows the transfer; only fresh peers get one.
+                if message.raw_protobuf_len() > self.config.preamble_threshold() {
+                    let message_size: u64 = fragments
+                        .iter()
+                        .map(|fragment| fragment.fragment_data.len() as u64)
+                        .sum();
+                    let fresh: Vec<PeerId> = survivors
+                        .iter()
+                        .filter(|(_, indices)| indices.len() == fragments.len())
+                        .map(|(peer_id, _)| *peer_id)
+                        .collect();
+                    fresh.into_iter().for_each(|peer_id| {
+                        self.send_message(
+                            peer_id,
+                            RpcOut::Preamble(Preamble {
+                                message_id: message_id.clone(),
+                                message_size,
+                                topic_hash: message.topic.clone(),
+                            }),
+                        );
+                    });
+                }
+
+                if staggering
+                    && survivors.len() > 1
+                    && let Some(reached) = self.stagger_fragment_runs(
+                        message_id,
+                        &message.topic,
+                        &fragments,
+                        &survivors,
+                        queue_duration,
+                    )
+                {
+                    reached
+                } else {
+                    survivors
+                        .into_iter()
+                        .filter(|(peer_id, indices)| {
+                            self.send_fragment_run(*peer_id, &fragments, indices, queue_duration)
+                        })
+                        .count()
+                }
+            },
+        );
+
+        // Legacy peers get the whole message. When there is no fragment run to
+        // stagger, whole-message sends stagger instead.
+        let legacy_reached = if staggering
+            && legacy.len() > 1
+            && let Some(reached) =
+                self.stagger_whole_sends(message_id, message, &legacy, queue_duration)
+        {
+            reached
+        } else {
+            legacy
+                .iter()
+                .filter(|peer_id| {
+                    self.send_message(
+                        **peer_id,
+                        RpcOut::Publish {
+                            message_id: message_id.clone(),
+                            message: message.clone(),
+                            timeout: Delay::new(queue_duration),
+                        },
+                    )
+                })
+                .count()
+        };
+
+        legacy_reached + capable_reached > 0
+    }
+
+    /// Pushes the fragments of one run whose indices are in `indices` to
+    /// `peer_id`. Returns `true` only when every push succeeded.
+    fn send_fragment_run(
+        &mut self,
+        peer_id: PeerId,
+        fragments: &[LargeMessageFragment],
+        indices: &[u32],
+        queue_duration: Duration,
+    ) -> bool {
+        fragments
+            .iter()
+            .filter(|fragment| indices.binary_search(&fragment.fragment_index).is_ok())
+            .all(|fragment| {
+                self.send_message(
+                    peer_id,
+                    RpcOut::LargeMessageFragment {
+                        fragment: fragment.clone(),
+                        timeout: Delay::new(queue_duration),
+                    },
+                )
+            })
+    }
+
+    /// Staggers the fragment runs in `survivors`: the best-placed peer is sent
+    /// immediately and every later run is deferred by one `stagger_interval`
+    /// step each. Returns the number of peers reached (immediate plus
+    /// deferred), or `None` when a stagger cap refuses the message; nothing
+    /// was sent in that case and the caller falls back to immediate sends.
+    fn stagger_fragment_runs(
+        &mut self,
+        message_id: &MessageId,
+        topic_hash: &TopicHash,
+        fragments: &[LargeMessageFragment],
+        survivors: &[(PeerId, Vec<u32>)],
+        queue_duration: Duration,
+    ) -> Option<usize> {
+        let ordered = self.stagger_order(
+            message_id,
+            survivors.iter().map(|(peer_id, _)| *peer_id).collect(),
+        );
+        let (first, deferred) = ordered.split_first()?;
+        let bytes = fragments
+            .iter()
+            .map(|fragment| fragment.fragment_data.len())
+            .sum();
+        let payload = large_messages::StaggerPayload::Fragments(Arc::from(fragments.to_vec()));
+        self.admit_staggered(
+            message_id,
+            topic_hash,
+            payload,
+            bytes,
+            deferred,
+            queue_duration,
+        )
+        .then(|| {
+            let first_indices = survivors
+                .iter()
+                .find(|(peer_id, _)| peer_id == first)
+                .map(|(_, indices)| indices.as_slice())
+                .unwrap_or(&[]);
+            self.send_fragment_run(*first, fragments, first_indices, queue_duration);
+            ordered.len()
+        })
+    }
+
+    /// Staggers whole-message sends to `recipients` without the extension: the
+    /// best-placed peer is sent immediately, the rest are deferred one
+    /// `stagger_interval` step each. Returns `None` when a cap refuses the
+    /// message, or when its id already staggers a fragment run; the caller
+    /// then sends immediately.
+    fn stagger_whole_sends(
+        &mut self,
+        message_id: &MessageId,
+        message: &RawMessage,
+        recipients: &[PeerId],
+        queue_duration: Duration,
+    ) -> Option<usize> {
+        let ordered = self.stagger_order(message_id, recipients.to_vec());
+        let (first, deferred) = ordered.split_first()?;
+        let bytes = message.raw_protobuf_len();
+        let payload = large_messages::StaggerPayload::Whole(Arc::new(message.clone()));
+        self.admit_staggered(
+            message_id,
+            &message.topic,
+            payload,
+            bytes,
+            deferred,
+            queue_duration,
+        )
+        .then(|| {
+            self.send_message(
+                *first,
+                RpcOut::Publish {
+                    message_id: message_id.clone(),
+                    message: message.clone(),
+                    timeout: Delay::new(queue_duration),
+                },
+            );
+            ordered.len()
+        })
+    }
+
+    /// Orders peers for a staggered run: descending peer score, ties broken by
+    /// a shuffle seeded from the message id, so equally scored peers do not
+    /// always receive large messages in the same order.
+    fn stagger_order(&self, message_id: &MessageId, mut peers: Vec<PeerId>) -> Vec<PeerId> {
+        let mut hasher = DefaultHasher::new();
+        std::hash::Hash::hash(message_id, &mut hasher);
+        peers.shuffle(&mut StdRng::seed_from_u64(std::hash::Hasher::finish(
+            &hasher,
+        )));
+        let score_of = |peer_id: &PeerId| match &self.peer_score {
+            PeerScoreState::Active(peer_score) => peer_score.score_report(peer_id).score,
+            PeerScoreState::Disabled => 0.0,
+        };
+        peers.sort_by(|a, b| score_of(b).partial_cmp(&score_of(a)).unwrap_or(Equal));
+        peers
+    }
+
+    /// Admits one staggered message: sends nothing itself, but queues one
+    /// deferred send per peer in `deferred` and charges `bytes` against
+    /// [`large_messages::MAX_STAGGER_BYTES`]. Returns `false`, with the queue
+    /// untouched, when a cap would be exceeded or the id is already staggered;
+    /// the caller then degrades to immediate sends instead of dropping.
+    fn admit_staggered(
+        &mut self,
+        message_id: &MessageId,
+        topic_hash: &TopicHash,
+        payload: large_messages::StaggerPayload,
+        bytes: usize,
+        deferred: &[PeerId],
+        queue_duration: Duration,
+    ) -> bool {
+        let admitted = !deferred.is_empty()
+            && !self.stagger_payloads.contains_key(message_id)
+            && self.stagger_payloads.len() < large_messages::MAX_STAGGERED_MESSAGES
+            && self.stagger_queue.len() + deferred.len() <= large_messages::STAGGER_CAP
+            && self.stagger_bytes + bytes <= large_messages::MAX_STAGGER_BYTES;
+        if admitted {
+            let now = Instant::now();
+            // The whole message must be out well before its queue timeout: cap
+            // the window at a full mesh of stagger steps, doubled for slack.
+            let window = self
+                .config
+                .stagger_interval()
+                .saturating_mul(self.config.mesh_n_high() as u32)
+                .saturating_mul(2);
+            let deadline = now + window.min(queue_duration);
+            deferred.iter().enumerate().for_each(|(i, peer_id)| {
+                // Recorded so the pre-dispatch re-check can tell a peer that
+                // left the mesh mid-window from a recipient that was never in
+                // it: explicit, floodsub, fanout and flood-publish recipients
+                // are deliberate non-mesh recipients and must still be sent.
+                let mesh_member = self
+                    .mesh
+                    .get(topic_hash)
+                    .is_some_and(|mesh_peers| mesh_peers.contains(peer_id));
+                let entry = large_messages::StaggeredSend {
+                    peer_id: *peer_id,
+                    message_id: message_id.clone(),
+                    topic_hash: topic_hash.clone(),
+                    queue_duration,
+                    due: now + self.config.stagger_interval().saturating_mul(i as u32 + 1),
+                    mesh_member,
+                };
+                let position = self
+                    .stagger_queue
+                    .partition_point(|queued| queued.due <= entry.due);
+                self.stagger_queue.insert(position, entry);
+            });
+            self.stagger_payloads.insert(
+                message_id.clone(),
+                large_messages::StaggeredMessage {
+                    payload,
+                    bytes,
+                    pending: deferred.len(),
+                    deadline,
+                },
+            );
+            self.stagger_bytes += bytes;
+            if let Some(front) = self.stagger_queue.front() {
+                self.stagger_timer
+                    .reset(front.due.saturating_duration_since(now));
+            }
+        }
+        #[cfg(feature = "metrics")]
+        self.record_stagger_queue_depth();
+        admitted
+    }
+
+    /// Sends every staggered entry that is due, plus every entry of a message
+    /// whose deadline has passed, re-checking each peer immediately before its
+    /// send. The re-check, not the delay, is what staggering buys: an
+    /// IDONTWANT or IMRECEIVING that arrived during the window suppresses the
+    /// send that would have duplicated the transfer.
+    fn flush_staggered_sends(&mut self) {
+        let now = Instant::now();
+        let expired: HashSet<MessageId> = self
+            .stagger_payloads
+            .iter()
+            .filter(|(_, staggered)| staggered.deadline <= now)
+            .map(|(message_id, _)| message_id.clone())
+            .collect();
+        let (ready, waiting): (Vec<_>, Vec<_>) = self
+            .stagger_queue
+            .drain(..)
+            .partition(|entry| entry.due <= now || expired.contains(&entry.message_id));
+        self.stagger_queue = waiting.into();
+        ready
+            .into_iter()
+            .for_each(|entry| self.dispatch_staggered_send(entry));
+        #[cfg(feature = "metrics")]
+        self.record_stagger_queue_depth();
+    }
+
+    /// Sends one deferred entry, unless a re-check suppresses it: the peer
+    /// must still be connected, must not have left the topic mesh when it was
+    /// a mesh member at enqueue time, must not have sent IDONTWANT or
+    /// IMRECEIVING for the message, and, for a fragment run, must still
+    /// advertise the extension. The entry is released either way.
+    fn dispatch_staggered_send(&mut self, entry: large_messages::StaggeredSend) {
+        let payload =
+            self.stagger_payloads
+                .get(&entry.message_id)
+                .map(|staggered| match &staggered.payload {
+                    large_messages::StaggerPayload::Whole(message) => {
+                        large_messages::StaggerPayload::Whole(Arc::clone(message))
+                    }
+                    large_messages::StaggerPayload::Fragments(fragments) => {
+                        large_messages::StaggerPayload::Fragments(Arc::clone(fragments))
+                    }
+                });
+        self.release_staggered_entry(&entry.message_id);
+        let connected = self.connected_peers.get(&entry.peer_id);
+        let disconnected = connected.is_none();
+        let idontwant =
+            connected.is_some_and(|peer| peer.dont_send.contains_key(&entry.message_id));
+        let imreceiving =
+            connected.is_some_and(|peer| peer.imreceiving.contains_key(&entry.message_id));
+        // Only a peer that was in the mesh when the send was deferred is
+        // re-checked for membership: explicit, floodsub, fanout and
+        // flood-publish recipients were never in the mesh and are sent anyway.
+        let left_mesh = entry.mesh_member
+            && !self
+                .mesh
+                .get(&entry.topic_hash)
+                .is_some_and(|mesh_peers| mesh_peers.contains(&entry.peer_id));
+        let suppressed = disconnected || idontwant || imreceiving || left_mesh;
+        if suppressed && payload.is_some() {
+            #[cfg(feature = "metrics")]
+            if let Some(m) = self.metrics.as_mut() {
+                let reason = match () {
+                    () if disconnected => StaggerSkip::Disconnected,
+                    () if idontwant => StaggerSkip::Idontwant,
+                    () if imreceiving => StaggerSkip::Imreceiving,
+                    () => StaggerSkip::LeftMesh,
+                };
+                m.register_stagger_peer_skipped(reason);
+            }
+            tracing::debug!(
+                peer=%entry.peer_id,
+                message=%entry.message_id,
+                "Staggered send suppressed"
+            );
+        }
+        if let Some(payload) = payload.filter(|_| !suppressed) {
+            match payload {
+                large_messages::StaggerPayload::Whole(message) => {
+                    self.send_message(
+                        entry.peer_id,
+                        RpcOut::Publish {
+                            message_id: entry.message_id.clone(),
+                            message: (*message).clone(),
+                            timeout: Delay::new(entry.queue_duration),
+                        },
+                    );
+                }
+                large_messages::StaggerPayload::Fragments(fragments) => {
+                    if self.supports_large_messages(&entry.peer_id) {
+                        // The relay ledger may have reached this peer during
+                        // the window; send only what it is still missing.
+                        let missing = self.large_messages.missing_indices(
+                            &entry.message_id,
+                            &entry.peer_id,
+                            fragments.len() as u32,
+                        );
+                        self.send_fragment_run(
+                            entry.peer_id,
+                            &fragments,
+                            &missing,
+                            entry.queue_duration,
+                        );
+                    } else {
+                        #[cfg(feature = "metrics")]
+                        if let Some(m) = self.metrics.as_mut() {
+                            m.register_stagger_peer_skipped(StaggerSkip::ExtensionLost);
+                        }
+                        tracing::debug!(
+                            peer=%entry.peer_id,
+                            message=%entry.message_id,
+                            "Staggered fragment run skipped: extension no longer advertised"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Releases one queued send of `message_id`, dropping the shared payload
+    /// and refunding its byte charge when the last send is released.
+    fn release_staggered_entry(&mut self, message_id: &MessageId) {
+        let emptied = self
+            .stagger_payloads
+            .get_mut(message_id)
+            .map(|staggered| {
+                staggered.pending = staggered.pending.saturating_sub(1);
+                staggered.pending == 0
+            })
+            .unwrap_or(false);
+        if emptied && let Some(staggered) = self.stagger_payloads.remove(message_id) {
+            self.stagger_bytes = self.stagger_bytes.saturating_sub(staggered.bytes);
+        }
+    }
+
+    /// Drops every staggered send for `message_id`. Called when the
+    /// application rejects or ignores the message: continuing to stagger it
+    /// out would forward bytes we have decided are invalid.
+    fn cancel_staggered_sends(&mut self, message_id: &MessageId) {
+        if let Some(staggered) = self.stagger_payloads.remove(message_id) {
+            self.stagger_bytes = self.stagger_bytes.saturating_sub(staggered.bytes);
+            self.stagger_queue
+                .retain(|entry| entry.message_id != *message_id);
+        }
+        #[cfg(feature = "metrics")]
+        self.record_stagger_queue_depth();
+    }
+
+    /// Records the stagger queue depth gauge.
+    #[cfg(feature = "metrics")]
+    fn record_stagger_queue_depth(&mut self) {
+        let queued = self.stagger_queue.len();
+        if let Some(m) = self.metrics.as_mut() {
+            m.set_stagger_sends_in_flight(queued);
+        }
+    }
+
     /// Send a [`RpcOut`] message to a peer.
     ///
     /// Returns `true` if sending was successful, `false` otherwise.
@@ -3134,6 +4019,15 @@ where
                     m.msg_sent(&message.topic, false, message.raw_protobuf_len())
                 }
 
+                RpcOut::LargeMessageFragment { fragment, .. } => {
+                    m.register_fragment_sent();
+                    m.msg_sent(&fragment.topic_hash, false, fragment.fragment_data.len())
+                }
+
+                RpcOut::Preamble(_) => m.register_preamble_sent(),
+
+                RpcOut::ImReceiving(_) => m.register_imreceiving_sent(),
+
                 #[cfg(feature = "partial-messages")]
                 RpcOut::PartialMessage(crate::partial_messages::PartialMessage {
                     topic_hash,
@@ -3148,14 +4042,27 @@ where
             }
         }
 
+        // Whether the peer advertised the v1.4 Large Message Handling extension;
+        // computed before the peer's queues are borrowed mutably.
+        let supports_large_messages = self.supports_large_messages(&peer_id);
+
         let Some(peer) = &mut self.connected_peers.get_mut(&peer_id) else {
             tracing::error!(peer = %peer_id,
                     "Could not send rpc to connection handler, peer doesn't exist in connected peer list");
             return false;
         };
 
-        if peer.kind < PeerKind::Gossipsubv1_2 && matches!(rpc, RpcOut::IDontWant(..)) {
-            tracing::trace!(peer=%peer_id, "Won't send IDONTWANT message for message to peer as it doesn't support Gossipsub v1.2");
+        let requires_v1_2 =
+            peer.kind < PeerKind::Gossipsubv1_2 && matches!(rpc, RpcOut::IDontWant(..));
+        // v1.4 large message RPCs must only be sent to peers that advertised the
+        // Large Message Handling extension.
+        let requires_large_messages = !supports_large_messages
+            && matches!(
+                rpc,
+                RpcOut::Preamble(_) | RpcOut::ImReceiving(_) | RpcOut::LargeMessageFragment { .. }
+            );
+        if requires_v1_2 || requires_large_messages {
+            tracing::trace!(peer=%peer_id, ?rpc, "Won't send rpc to peer as it doesn't support the required protocol version or extension");
             return false;
         }
 
@@ -3339,6 +4246,29 @@ where
                 metrics.peer_protocol_disconnected(connected_peer.kind);
             }
 
+            self.large_messages.peer_disconnected(&peer_id);
+
+            // Drop staggered sends aimed at the departing peer.
+            let stagger_dropped: Vec<MessageId> = self
+                .stagger_queue
+                .iter()
+                .filter(|entry| entry.peer_id == peer_id)
+                .map(|entry| entry.message_id.clone())
+                .collect();
+            self.stagger_queue.retain(|entry| entry.peer_id != peer_id);
+            stagger_dropped
+                .iter()
+                .for_each(|message_id| self.release_staggered_entry(message_id));
+
+            #[cfg(feature = "metrics")]
+            {
+                let bytes_in_use = self.large_messages.reassembly_bytes_in_use();
+                if let Some(metrics) = self.metrics.as_mut() {
+                    metrics.set_reassembly_bytes_in_use(bytes_in_use);
+                }
+                self.record_stagger_queue_depth();
+            }
+
             self.connected_peers.remove(&peer_id);
 
             if let PeerScoreState::Active(peer_score) = &mut self.peer_score {
@@ -3420,9 +4350,14 @@ where
             kind: PeerKind::Floodsub,
             connections: vec![],
             outbound: false,
-            messages: Queue::new(self.config.connection_handler_queue_len()),
+            messages: Queue::new(
+                self.config.connection_handler_queue_len(),
+                self.config.max_queued_fragments_per_peer(),
+            ),
             topics: Default::default(),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
             extensions: None,
         });
         // Add the new connection
@@ -3461,9 +4396,14 @@ where
             // Diverging from the go implementation we only want to consider a peer as outbound peer
             // if its first connection is outbound.
             outbound: !self.px_peers.contains(&peer_id),
-            messages: Queue::new(self.config.connection_handler_queue_len()),
+            messages: Queue::new(
+                self.config.connection_handler_queue_len(),
+                self.config.max_queued_fragments_per_peer(),
+            ),
             topics: Default::default(),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
             extensions: None,
         });
         // Add the new connection
@@ -3642,22 +4582,101 @@ where
                             }
                         }
                         ControlAction::Preamble(preamble) => {
-                            // Large message handling is not yet implemented.
-                            tracing::trace!(
-                                peer=%propagation_source,
-                                message=%preamble.message_id,
-                                message_size=%preamble.message_size,
-                                topic=%preamble.topic_hash,
-                                "Ignoring PREAMBLE control message"
-                            );
+                            #[cfg(feature = "metrics")]
+                            if let Some(m) = self.metrics.as_mut() {
+                                m.register_preamble_received();
+                            }
+                            match () {
+                                () if !self.config.large_message_handling() => {
+                                    tracing::trace!(
+                                        peer=%propagation_source,
+                                        message=%preamble.message_id,
+                                        message_size=%preamble.message_size,
+                                        topic=%preamble.topic_hash,
+                                        "Ignoring PREAMBLE control message"
+                                    );
+                                }
+                                // Spec 654 Safety Strategy: accept a PREAMBLE
+                                // only from mesh members.
+                                () if !self
+                                    .mesh
+                                    .get(&preamble.topic_hash)
+                                    .is_some_and(|m| m.contains(&propagation_source)) =>
+                                {
+                                    tracing::debug!(
+                                        peer=%propagation_source,
+                                        message=%preamble.message_id,
+                                        "Ignoring PREAMBLE from a peer outside the mesh"
+                                    );
+                                }
+                                // Spec 720 PREAMBLE receiver rule 4: we already
+                                // hold this message, ask the sender to stop.
+                                () if self.duplicate_cache.contains(&preamble.message_id) => {
+                                    self.send_message(
+                                        propagation_source,
+                                        RpcOut::IDontWant(IDontWant {
+                                            message_ids: vec![preamble.message_id],
+                                        }),
+                                    );
+                                }
+                                () => {
+                                    let limits = self.large_message_limits(&preamble.topic_hash);
+                                    let actions = self.large_messages.handle_preamble(
+                                        &propagation_source,
+                                        preamble,
+                                        &limits,
+                                    );
+                                    self.handle_large_message_actions(&propagation_source, actions);
+                                }
+                            }
                         }
                         ControlAction::ImReceiving(imreceiving) => {
-                            // Large message handling is not yet implemented.
-                            tracing::trace!(
-                                peer=%propagation_source,
-                                message=%imreceiving.message_id,
-                                "Ignoring IMRECEIVING control message"
-                            );
+                            #[cfg(feature = "metrics")]
+                            if let Some(m) = self.metrics.as_mut() {
+                                m.register_imreceiving_received();
+                            }
+                            let from_mesh_member = self
+                                .mesh
+                                .values()
+                                .any(|peers| peers.contains(&propagation_source));
+                            match () {
+                                () if !self.config.large_message_handling() => {
+                                    tracing::trace!(
+                                        peer=%propagation_source,
+                                        message=%imreceiving.message_id,
+                                        "Ignoring IMRECEIVING control message"
+                                    );
+                                }
+                                // Accept only from mesh members: the closest
+                                // enforceable substitute for spec 654's length
+                                // cross-check, which our wire type cannot
+                                // support. IMRECEIVING is advisory and MUST NOT
+                                // be penalized, and suppression is never
+                                // applied to explicit peers.
+                                () if !from_mesh_member
+                                    || self.explicit_peers.contains(&propagation_source) =>
+                                {
+                                    tracing::trace!(
+                                        peer=%propagation_source,
+                                        message=%imreceiving.message_id,
+                                        "Ignoring advisory IMRECEIVING from a non-mesh or explicit peer"
+                                    );
+                                }
+                                () => {
+                                    if let Some(peer) =
+                                        self.connected_peers.get_mut(&propagation_source)
+                                    {
+                                        peer.messages.remove_data_messages(std::slice::from_ref(
+                                            &imreceiving.message_id,
+                                        ));
+                                        peer.imreceiving
+                                            .insert(imreceiving.message_id, Instant::now());
+                                        if peer.imreceiving.len() > IMRECEIVING_CAP {
+                                            peer.imreceiving.pop_front();
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -3671,20 +4690,129 @@ where
                     self.handle_prune(&propagation_source, prune_msgs);
                 }
 
-                // Large message handling is not yet implemented.
-                rpc.large_message_fragments
-                    .into_iter()
-                    .for_each(|fragment| {
-                        tracing::trace!(
+                #[cfg(feature = "metrics")]
+                if let Some(m) = self.metrics.as_mut() {
+                    m.register_fragments_received(rpc.large_message_fragments.len());
+                }
+                match () {
+                    () if !self.config.large_message_handling() => {
+                        #[cfg(feature = "metrics")]
+                        if let Some(m) = self.metrics.as_mut() {
+                            m.register_fragments_dropped(
+                                FragmentDrop::Disabled,
+                                rpc.large_message_fragments.len(),
+                            );
+                        }
+                        rpc.large_message_fragments
+                            .into_iter()
+                            .for_each(|fragment| {
+                                tracing::trace!(
+                                    peer=%propagation_source,
+                                    message=%fragment.message_id,
+                                    fragment_index=%fragment.fragment_index,
+                                    total_fragments=%fragment.total_fragments,
+                                    fragment_len=%fragment.fragment_data.len(),
+                                    topic=%fragment.topic_hash,
+                                    "Ignoring large message fragment"
+                                );
+                            });
+                    }
+                    () if self
+                        .peer_score
+                        .below_threshold(&propagation_source, |ts| ts.graylist_threshold)
+                        .0 =>
+                    {
+                        #[cfg(feature = "metrics")]
+                        if let Some(m) = self.metrics.as_mut() {
+                            m.register_fragments_dropped(
+                                FragmentDrop::BelowThreshold,
+                                rpc.large_message_fragments.len(),
+                            );
+                        }
+                        tracing::debug!(
                             peer=%propagation_source,
-                            message=%fragment.message_id,
-                            fragment_index=%fragment.fragment_index,
-                            total_fragments=%fragment.total_fragments,
-                            fragment_len=%fragment.fragment_data.len(),
-                            topic=%fragment.topic_hash,
-                            "Ignoring large message fragment"
+                            "Peer below threshold, ignoring large message fragments"
                         );
-                    });
+                    }
+                    () => {
+                        let validation_mode = self.config.validation_mode().clone();
+                        // One IDONTWANT per already-held id per RPC, however
+                        // many of its fragments the RPC carries.
+                        let mut suppressed: HashSet<MessageId> = HashSet::new();
+                        rpc.large_message_fragments
+                            .into_iter()
+                            .for_each(|fragment| match () {
+                                // We already hold the whole message: drop the
+                                // fragment without opening a buffer and ask
+                                // the sender to stop.
+                                () if self.duplicate_cache.contains(&fragment.message_id) => {
+                                    #[cfg(feature = "metrics")]
+                                    if let Some(m) = self.metrics.as_mut() {
+                                        m.register_fragments_dropped(FragmentDrop::Duplicate, 1);
+                                    }
+                                    if suppressed.insert(fragment.message_id.clone()) {
+                                        self.handle_large_message_actions(
+                                            &propagation_source,
+                                            vec![large_messages::ReceivedAction::SuppressSender {
+                                                peer_id: propagation_source,
+                                                message_id: fragment.message_id,
+                                            }],
+                                        );
+                                    }
+                                }
+                                () => {
+                                    #[cfg(feature = "metrics")]
+                                    let message_id = fragment.message_id.clone();
+                                    #[cfg(feature = "metrics")]
+                                    let was_reassembling = self
+                                        .large_messages
+                                        .is_reassembling(&propagation_source, &message_id);
+                                    let limits = self.large_message_limits(&fragment.topic_hash);
+                                    // Mesh and explicit senders outrank
+                                    // non-mesh senders for the per-id
+                                    // reassembly slots.
+                                    let from_mesh = self
+                                        .mesh
+                                        .get(&fragment.topic_hash)
+                                        .is_some_and(|peers| {
+                                            peers.contains(&propagation_source)
+                                        })
+                                        || self.explicit_peers.contains(&propagation_source);
+                                    let actions = self.large_messages.handle_fragment(
+                                        &propagation_source,
+                                        fragment,
+                                        from_mesh,
+                                        &limits,
+                                        &validation_mode,
+                                    );
+                                    #[cfg(feature = "metrics")]
+                                    {
+                                        let completed = actions.iter().any(|action| {
+                                            matches!(
+                                                action,
+                                                large_messages::ReceivedAction::MessageReassembled { .. }
+                                            )
+                                        });
+                                        let started = !was_reassembling
+                                            && (completed
+                                                || self.large_messages.is_reassembling(
+                                                    &propagation_source,
+                                                    &message_id,
+                                                ));
+                                        let bytes_in_use =
+                                            self.large_messages.reassembly_bytes_in_use();
+                                        if let Some(m) = self.metrics.as_mut() {
+                                            if started {
+                                                m.register_reassembly_started();
+                                            }
+                                            m.set_reassembly_bytes_in_use(bytes_in_use);
+                                        }
+                                    }
+                                    self.handle_large_message_actions(&propagation_source, actions);
+                                }
+                            });
+                    }
+                }
 
                 #[cfg(feature = "partial-messages")]
                 if let Some(partial_message) = rpc.partial_message {
@@ -3761,6 +4889,14 @@ where
         if self.heartbeat.poll_unpin(cx).is_ready() {
             self.heartbeat();
             self.heartbeat.reset(self.config.heartbeat_interval());
+        }
+
+        if !self.stagger_queue.is_empty() && self.stagger_timer.poll_unpin(cx).is_ready() {
+            self.flush_staggered_sends();
+            if let Some(next) = self.stagger_queue.front() {
+                self.stagger_timer
+                    .reset(next.due.saturating_duration_since(Instant::now()));
+            }
         }
 
         Poll::Pending

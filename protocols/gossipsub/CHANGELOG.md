@@ -4,6 +4,23 @@
   ([issue 6597](https://github.com/libp2p/rust-libp2p/issues/6597)).
   See [PR 6599](https://github.com/libp2p/rust-libp2p/pull/6599).
 
+- Implement the gossipsub v1.4 Large Message Handling extension behind the default-off
+  `large_message_handling` config option: publish- and forward-side fragmentation above
+  `fragmentation_threshold`, bounded reassembly, fragment relay before full reassembly,
+  size-gated PREAMBLE and IMRECEIVING, and staggered sending. Message size stays bounded
+  by `max_transmit_size_for_topic`. Adds `fragment_size` (default 60 KiB, below the spec's
+  64 KiB so a fragment RPC fits `max_transmit_size`), `fragmentation_threshold`,
+  `preamble_threshold` (default 400 KiB, above the spec's 64 KiB, see the PR body),
+  `stagger_threshold`, `stagger_interval`, `fragment_timeout`, `max_pending_fragments`,
+  `max_reassembly_bytes_per_peer`, `max_reassembly_bytes_total`,
+  `max_queued_fragments_per_peer` (default 128, held at or above one whole max-size
+  message by a `build()` check) and `max_preamble_announcements_per_peer` to
+  `ConfigBuilder`. `fragment_size` applies to what this node sends; inbound fragments are
+  bounded by `max_transmit_size` alone, so a peer may use any chunk size it likes.
+  Adds `ValidationError::MessageReassemblyFailed`
+  ([issue 6597](https://github.com/libp2p/rust-libp2p/issues/6597)).
+  See [PR XXXX](https://github.com/libp2p/rust-libp2p/pull/XXXX).
+
 - Change default `TopicSubscriptionFilter` from `AllowAllSubscriptionFilter` to `MaxCountSubscriptionFilter<AllowAllSubscriptionFilter>`
   with default limits of `100` for both `max_subscribed_topics` and `max_subscriptions_per_request`,
   providing built-in protection against excessive subscription requests.

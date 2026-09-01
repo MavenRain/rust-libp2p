@@ -33,7 +33,7 @@ use crate::{
     peer_score::{PeerScoreParams, PeerScoreThresholds},
     queue::Queue,
     transform::DataTransform,
-    types::{Message, PeerDetails, PeerKind},
+    types::{Message, MessageId, PeerDetails, PeerKind, Preamble, RpcOut},
 };
 
 #[test]
@@ -60,8 +60,10 @@ fn test_all_queues_full() {
             connections: vec![ConnectionId::new_unchecked(0)],
             outbound: false,
             topics: topics.clone(),
-            messages: Queue::new(1),
+            messages: Queue::new(1, 128),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
         },
     );
 
@@ -98,8 +100,10 @@ fn test_slow_peer_returns_failed_publish() {
             connections: vec![ConnectionId::new_unchecked(0)],
             outbound: false,
             topics: topics.clone(),
-            messages: Queue::new(1),
+            messages: Queue::new(1, 128),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
         },
     );
     let peer_id = PeerId::random();
@@ -112,8 +116,13 @@ fn test_slow_peer_returns_failed_publish() {
             connections: vec![ConnectionId::new_unchecked(0)],
             outbound: false,
             topics: topics.clone(),
-            messages: Queue::new(gs.config.connection_handler_queue_len()),
+            messages: Queue::new(
+                gs.config.connection_handler_queue_len(),
+                gs.config.max_queued_fragments_per_peer(),
+            ),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
         },
     );
 
@@ -165,8 +174,10 @@ fn test_slow_peer_returns_failed_ihave_handling() {
             connections: vec![ConnectionId::new_unchecked(0)],
             outbound: false,
             topics: topics.clone(),
-            messages: Queue::new(1),
+            messages: Queue::new(1, 128),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
         },
     );
     peers.push(slow_peer_id);
@@ -183,8 +194,13 @@ fn test_slow_peer_returns_failed_ihave_handling() {
             connections: vec![ConnectionId::new_unchecked(0)],
             outbound: false,
             topics: topics.clone(),
-            messages: Queue::new(gs.config.connection_handler_queue_len()),
+            messages: Queue::new(
+                gs.config.connection_handler_queue_len(),
+                gs.config.max_queued_fragments_per_peer(),
+            ),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
         },
     );
 
@@ -272,8 +288,10 @@ fn test_slow_peer_returns_failed_iwant_handling() {
             connections: vec![ConnectionId::new_unchecked(0)],
             outbound: false,
             topics: topics.clone(),
-            messages: Queue::new(1),
+            messages: Queue::new(1, 128),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
         },
     );
     peers.push(slow_peer_id);
@@ -290,8 +308,13 @@ fn test_slow_peer_returns_failed_iwant_handling() {
             connections: vec![ConnectionId::new_unchecked(0)],
             outbound: false,
             topics: topics.clone(),
-            messages: Queue::new(gs.config.connection_handler_queue_len()),
+            messages: Queue::new(
+                gs.config.connection_handler_queue_len(),
+                gs.config.max_queued_fragments_per_peer(),
+            ),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
         },
     );
 
@@ -359,8 +382,10 @@ fn test_slow_peer_returns_failed_forward() {
             connections: vec![ConnectionId::new_unchecked(0)],
             outbound: false,
             topics: topics.clone(),
-            messages: Queue::new(1),
+            messages: Queue::new(1, 128),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
         },
     );
     peers.push(slow_peer_id);
@@ -377,8 +402,13 @@ fn test_slow_peer_returns_failed_forward() {
             connections: vec![ConnectionId::new_unchecked(0)],
             outbound: false,
             topics: topics.clone(),
-            messages: Queue::new(gs.config.connection_handler_queue_len()),
+            messages: Queue::new(
+                gs.config.connection_handler_queue_len(),
+                gs.config.max_queued_fragments_per_peer(),
+            ),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
         },
     );
 
@@ -451,8 +481,10 @@ fn test_slow_peer_is_downscored_on_publish() {
             connections: vec![ConnectionId::new_unchecked(0)],
             outbound: false,
             topics: topics.clone(),
-            messages: Queue::new(1),
+            messages: Queue::new(1, 128),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
         },
     );
     gs.as_peer_score_mut().add_peer(slow_peer_id);
@@ -466,8 +498,13 @@ fn test_slow_peer_is_downscored_on_publish() {
             connections: vec![ConnectionId::new_unchecked(0)],
             outbound: false,
             topics: topics.clone(),
-            messages: Queue::new(gs.config.connection_handler_queue_len()),
+            messages: Queue::new(
+                gs.config.connection_handler_queue_len(),
+                gs.config.max_queued_fragments_per_peer(),
+            ),
             dont_send: LinkedHashMap::new(),
+            imreceiving: LinkedHashMap::new(),
+            fragments_relayed: LinkedHashMap::new(),
         },
     );
 
@@ -480,4 +517,21 @@ fn test_slow_peer_is_downscored_on_publish() {
     let slow_peer_score = gs.peer_score(&slow_peer_id).unwrap();
     // There should be two penalties for the two failed messages.
     assert_eq!(slow_peer_score, slow_peer_params.slow_peer_weight * 2.0);
+}
+
+/// A PREAMBLE control message is routed to the bounded control queue,
+/// not to the fragments tier.
+#[test]
+fn test_preamble_routed_to_control_queue() {
+    let mut queue = Queue::new(1, 1);
+    queue
+        .try_push(RpcOut::Preamble(Preamble {
+            message_id: MessageId::new(&[1]),
+            message_size: 1 << 20,
+            topic_hash: Topic::new("Test").hash(),
+        }))
+        .unwrap();
+    assert!(!queue.control.is_empty());
+    assert!(queue.fragments.is_empty());
+    assert!(queue.non_priority.is_empty());
 }

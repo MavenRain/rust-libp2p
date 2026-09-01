@@ -152,8 +152,13 @@ fn test_get_random_peers() {
                 connections: vec![ConnectionId::new_unchecked(0)],
                 outbound: false,
                 topics: topics.clone(),
-                messages: Queue::new(gs.config.connection_handler_queue_len()),
+                messages: Queue::new(
+                    gs.config.connection_handler_queue_len(),
+                    gs.config.max_queued_fragments_per_peer(),
+                ),
                 dont_send: LinkedHashMap::new(),
+                imreceiving: LinkedHashMap::new(),
+                fragments_relayed: LinkedHashMap::new(),
             },
         );
     }

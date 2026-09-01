@@ -265,6 +265,9 @@ impl EnabledHandler {
                         tracing::debug!(peer=%self.peer_id, ?message, "Sending gossipsub message");
                         if let RpcOut::Publish {
                             ref mut timeout, ..
+                        }
+                        | RpcOut::LargeMessageFragment {
+                            ref mut timeout, ..
                         } = message
                             && Pin::new(timeout).poll(cx).is_ready()
                         {

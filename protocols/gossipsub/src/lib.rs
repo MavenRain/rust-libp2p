@@ -55,6 +55,20 @@
 //!   unsigned, they are chosen at random. NOTE: These numbers are sequential in the current go
 //!   implementation.
 //!
+//! # Large Message Handling
+//!
+//! This implementation supports the gossipsub v1.4 [Large Message Handling
+//! extension](https://github.com/libp2p/specs/pull/720). It is disabled by default and is
+//! enabled with [`Config::large_message_handling`]. When enabled, published and forwarded
+//! messages larger than [`Config::fragmentation_threshold`] are split into fragments that
+//! carry slices of the encoded protobuf message, so a receiver can verify the signature and
+//! recompute the message id after reassembly. Fragmentation raises no size ceiling:
+//! [`Config::max_transmit_size`] (or its per-topic override) stays the single authority on
+//! message size, and an operator enables large messages on a topic by raising that ceiling
+//! *and* enabling the extension. [`Config::fragment_size`] applies only to the fragments this
+//! node sends; inbound fragments are bounded by the transmit ceiling alone, so peers may use
+//! a different fragment size.
+//!
 //! # Peer Discovery
 //!
 //! Gossipsub does not provide peer discovery by itself. Peer discovery is the process by which

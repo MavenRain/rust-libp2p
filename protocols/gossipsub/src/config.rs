@@ -26,6 +26,7 @@ use libp2p_swarm::StreamProtocol;
 use crate::{
     TopicHash,
     error::ConfigBuilderError,
+    extensions::large_messages::LARGE_FRAGMENT_RPC_OVERHEAD,
     protocol::{FLOODSUB_PROTOCOL, ProtocolConfig, ProtocolId},
     types::{Message, MessageId, PeerKind},
 };
@@ -136,6 +137,17 @@ pub struct Config {
     idontwant_message_size_threshold: usize,
     idontwant_on_publish: bool,
     large_message_handling: bool,
+    fragment_size: usize,
+    fragmentation_threshold: usize,
+    preamble_threshold: usize,
+    stagger_threshold: usize,
+    stagger_interval: Duration,
+    fragment_timeout: Duration,
+    max_pending_fragments: usize,
+    max_reassembly_bytes_per_peer: usize,
+    max_reassembly_bytes_total: usize,
+    max_queued_fragments_per_peer: usize,
+    max_preamble_announcements_per_peer: usize,
     topic_configuration: TopicConfigs,
 }
 
@@ -494,6 +506,79 @@ impl Config {
         self.large_message_handling
     }
 
+    /// The maximum size in bytes of each fragment produced when a large message is
+    /// split under the Large Message Handling extension. This is a send side
+    /// parameter only; inbound fragments are not validated against it.
+    /// The default is 61440 (60KiB).
+    pub fn fragment_size(&self) -> usize {
+        self.fragment_size
+    }
+
+    /// The minimum message size in bytes at which a message is split into
+    /// fragments under the Large Message Handling extension.
+    /// The default is 65536 (64KiB).
+    pub fn fragmentation_threshold(&self) -> usize {
+        self.fragmentation_threshold
+    }
+
+    /// The minimum message size in bytes at which a PREAMBLE control message is
+    /// sent ahead of the message under the Large Message Handling extension.
+    /// The default is 409600 (400KiB).
+    pub fn preamble_threshold(&self) -> usize {
+        self.preamble_threshold
+    }
+
+    /// The minimum message size in bytes at which sending to mesh peers is
+    /// staggered under the Large Message Handling extension.
+    /// The default is 65536 (64KiB).
+    pub fn stagger_threshold(&self) -> usize {
+        self.stagger_threshold
+    }
+
+    /// The delay between starting transmissions of a large message to successive
+    /// mesh peers under the Large Message Handling extension.
+    /// The default is 200 milliseconds.
+    pub fn stagger_interval(&self) -> Duration {
+        self.stagger_interval
+    }
+
+    /// The maximum time to wait for the remaining fragments of a partially
+    /// received large message before its reassembly buffer is discarded.
+    /// The default is 30 seconds.
+    pub fn fragment_timeout(&self) -> Duration {
+        self.fragment_timeout
+    }
+
+    /// The maximum number of large messages that may be under reassembly from a
+    /// single peer at the same time. The default is 16.
+    pub fn max_pending_fragments(&self) -> usize {
+        self.max_pending_fragments
+    }
+
+    /// The maximum number of bytes of reassembly buffers held for a single peer.
+    /// The default is 4194304 (4MiB).
+    pub fn max_reassembly_bytes_per_peer(&self) -> usize {
+        self.max_reassembly_bytes_per_peer
+    }
+
+    /// The maximum number of bytes of reassembly buffers held across all peers.
+    /// The default is 67108864 (64MiB).
+    pub fn max_reassembly_bytes_total(&self) -> usize {
+        self.max_reassembly_bytes_total
+    }
+
+    /// The maximum number of outbound large message fragments queued for a
+    /// single peer. The default is 128.
+    pub fn max_queued_fragments_per_peer(&self) -> usize {
+        self.max_queued_fragments_per_peer
+    }
+
+    /// The maximum number of PREAMBLE announcements for transfers that have not
+    /// completed yet that are tracked per peer. The default is 16.
+    pub fn max_preamble_announcements_per_peer(&self) -> usize {
+        self.max_preamble_announcements_per_peer
+    }
+
     /// GossipSubMaxIHaveMessages is the maximum number of IHAVE messages to accept from a peer
     /// within a heartbeat.
     pub fn max_ihave_messages_heartbeat(&self) -> usize {
@@ -572,6 +657,17 @@ impl Default for ConfigBuilder {
                 idontwant_message_size_threshold: 1000,
                 idontwant_on_publish: false,
                 large_message_handling: false,
+                fragment_size: 61440,
+                fragmentation_threshold: 65536,
+                preamble_threshold: 409600,
+                stagger_threshold: 65536,
+                stagger_interval: Duration::from_millis(200),
+                fragment_timeout: Duration::from_secs(30),
+                max_pending_fragments: 16,
+                max_reassembly_bytes_per_peer: 4 * 1024 * 1024,
+                max_reassembly_bytes_total: 64 * 1024 * 1024,
+                max_queued_fragments_per_peer: 128,
+                max_preamble_announcements_per_peer: 16,
                 topic_configuration: TopicConfigs::default(),
             },
             invalid_protocol: false,
@@ -1082,12 +1178,257 @@ impl ConfigBuilder {
         self
     }
 
-    /// Advertise support for the gossipsub v1.4 Large Message Handling extension
-    /// (see <https://github.com/libp2p/specs/pull/720>) to peers on connection.
-    /// This only advertises the capability, large message fragmentation is not yet implemented.
-    /// By default it is false.
+    /// Enable the gossipsub v1.4 Large Message Handling extension
+    /// (see <https://github.com/libp2p/specs/pull/720>) and advertise it to peers
+    /// on connection. Fragmentation raises no size ceiling: raise
+    /// [`Self::max_transmit_size`] (or its per-topic override) alongside this
+    /// option to actually allow larger messages.
+    ///
+    /// Note: reassembled fragments are checked against the announced message id,
+    /// so a custom, non-collision-resistant [`Self::message_id_fn`] weakens
+    /// fragment-injection resistance.
+    ///
+    /// The default is false.
+    ///
+    /// ```rust
+    /// use libp2p_gossipsub::ConfigBuilder;
+    /// let mut config = ConfigBuilder::default();
+    /// assert!(!config.build().unwrap().large_message_handling());
+    /// config
+    ///     .max_transmit_size(1 << 20)
+    ///     .large_message_handling(true);
+    /// assert!(config.build().unwrap().large_message_handling());
+    /// ```
     pub fn large_message_handling(&mut self, large_message_handling: bool) -> &mut Self {
         self.config.large_message_handling = large_message_handling;
+        self
+    }
+
+    /// The maximum size in bytes of each fragment produced when a large message is
+    /// split under the Large Message Handling extension. This is a send side
+    /// parameter only; inbound fragments are not validated against it.
+    /// The default is 61440 (60KiB).
+    ///
+    /// ```rust
+    /// use libp2p_gossipsub::ConfigBuilder;
+    /// let mut config = ConfigBuilder::default();
+    /// config
+    ///     .max_transmit_size(1 << 20)
+    ///     .large_message_handling(true)
+    ///     .fragment_size(32 * 1024);
+    /// assert_eq!(config.build().unwrap().fragment_size(), 32 * 1024);
+    /// ```
+    pub fn fragment_size(&mut self, fragment_size: usize) -> &mut Self {
+        self.config.fragment_size = fragment_size;
+        self
+    }
+
+    /// The minimum message size in bytes at which a message is split into
+    /// fragments under the Large Message Handling extension.
+    /// The default is 65536 (64KiB).
+    ///
+    /// ```rust
+    /// use libp2p_gossipsub::ConfigBuilder;
+    /// let mut config = ConfigBuilder::default();
+    /// config
+    ///     .max_transmit_size(1 << 20)
+    ///     .large_message_handling(true)
+    ///     .fragmentation_threshold(128 * 1024);
+    /// assert_eq!(
+    ///     config.build().unwrap().fragmentation_threshold(),
+    ///     128 * 1024
+    /// );
+    /// ```
+    pub fn fragmentation_threshold(&mut self, fragmentation_threshold: usize) -> &mut Self {
+        self.config.fragmentation_threshold = fragmentation_threshold;
+        self
+    }
+
+    /// The minimum message size in bytes at which a PREAMBLE control message is
+    /// sent ahead of the message under the Large Message Handling extension.
+    /// The default is 409600 (400KiB).
+    ///
+    /// ```rust
+    /// use libp2p_gossipsub::ConfigBuilder;
+    /// let mut config = ConfigBuilder::default();
+    /// config
+    ///     .max_transmit_size(1 << 20)
+    ///     .large_message_handling(true)
+    ///     .preamble_threshold(512 * 1024);
+    /// assert_eq!(config.build().unwrap().preamble_threshold(), 512 * 1024);
+    /// ```
+    pub fn preamble_threshold(&mut self, preamble_threshold: usize) -> &mut Self {
+        self.config.preamble_threshold = preamble_threshold;
+        self
+    }
+
+    /// The minimum message size in bytes at which sending to mesh peers is
+    /// staggered under the Large Message Handling extension.
+    /// The default is 65536 (64KiB).
+    ///
+    /// ```rust
+    /// use libp2p_gossipsub::ConfigBuilder;
+    /// let mut config = ConfigBuilder::default();
+    /// config
+    ///     .max_transmit_size(1 << 20)
+    ///     .large_message_handling(true)
+    ///     .stagger_threshold(128 * 1024);
+    /// assert_eq!(config.build().unwrap().stagger_threshold(), 128 * 1024);
+    /// ```
+    pub fn stagger_threshold(&mut self, stagger_threshold: usize) -> &mut Self {
+        self.config.stagger_threshold = stagger_threshold;
+        self
+    }
+
+    /// The delay between starting transmissions of a large message to successive
+    /// mesh peers under the Large Message Handling extension.
+    /// The default is 200 milliseconds.
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    ///
+    /// use libp2p_gossipsub::ConfigBuilder;
+    /// let mut config = ConfigBuilder::default();
+    /// config
+    ///     .max_transmit_size(1 << 20)
+    ///     .large_message_handling(true)
+    ///     .stagger_interval(Duration::from_millis(100));
+    /// assert_eq!(
+    ///     config.build().unwrap().stagger_interval(),
+    ///     Duration::from_millis(100)
+    /// );
+    /// ```
+    pub fn stagger_interval(&mut self, stagger_interval: Duration) -> &mut Self {
+        self.config.stagger_interval = stagger_interval;
+        self
+    }
+
+    /// The maximum time to wait for the remaining fragments of a partially
+    /// received large message before its reassembly buffer is discarded.
+    /// The default is 30 seconds.
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    ///
+    /// use libp2p_gossipsub::ConfigBuilder;
+    /// let mut config = ConfigBuilder::default();
+    /// config
+    ///     .max_transmit_size(1 << 20)
+    ///     .large_message_handling(true)
+    ///     .fragment_timeout(Duration::from_secs(60));
+    /// assert_eq!(
+    ///     config.build().unwrap().fragment_timeout(),
+    ///     Duration::from_secs(60)
+    /// );
+    /// ```
+    pub fn fragment_timeout(&mut self, fragment_timeout: Duration) -> &mut Self {
+        self.config.fragment_timeout = fragment_timeout;
+        self
+    }
+
+    /// The maximum number of large messages that may be under reassembly from a
+    /// single peer at the same time. The default is 16.
+    ///
+    /// ```rust
+    /// use libp2p_gossipsub::ConfigBuilder;
+    /// let mut config = ConfigBuilder::default();
+    /// config
+    ///     .max_transmit_size(1 << 20)
+    ///     .large_message_handling(true)
+    ///     .max_pending_fragments(32);
+    /// assert_eq!(config.build().unwrap().max_pending_fragments(), 32);
+    /// ```
+    pub fn max_pending_fragments(&mut self, max_pending_fragments: usize) -> &mut Self {
+        self.config.max_pending_fragments = max_pending_fragments;
+        self
+    }
+
+    /// The maximum number of bytes of reassembly buffers held for a single peer.
+    /// The default is 4194304 (4MiB).
+    ///
+    /// ```rust
+    /// use libp2p_gossipsub::ConfigBuilder;
+    /// let mut config = ConfigBuilder::default();
+    /// config
+    ///     .max_transmit_size(1 << 20)
+    ///     .large_message_handling(true)
+    ///     .max_reassembly_bytes_per_peer(2 * 1024 * 1024);
+    /// assert_eq!(
+    ///     config.build().unwrap().max_reassembly_bytes_per_peer(),
+    ///     2 * 1024 * 1024
+    /// );
+    /// ```
+    pub fn max_reassembly_bytes_per_peer(
+        &mut self,
+        max_reassembly_bytes_per_peer: usize,
+    ) -> &mut Self {
+        self.config.max_reassembly_bytes_per_peer = max_reassembly_bytes_per_peer;
+        self
+    }
+
+    /// The maximum number of bytes of reassembly buffers held across all peers.
+    /// The default is 67108864 (64MiB).
+    ///
+    /// ```rust
+    /// use libp2p_gossipsub::ConfigBuilder;
+    /// let mut config = ConfigBuilder::default();
+    /// config
+    ///     .max_transmit_size(1 << 20)
+    ///     .large_message_handling(true)
+    ///     .max_reassembly_bytes_total(128 * 1024 * 1024);
+    /// assert_eq!(
+    ///     config.build().unwrap().max_reassembly_bytes_total(),
+    ///     128 * 1024 * 1024
+    /// );
+    /// ```
+    pub fn max_reassembly_bytes_total(&mut self, max_reassembly_bytes_total: usize) -> &mut Self {
+        self.config.max_reassembly_bytes_total = max_reassembly_bytes_total;
+        self
+    }
+
+    /// The maximum number of outbound large message fragments queued for a
+    /// single peer. The default is 128.
+    ///
+    /// ```rust
+    /// use libp2p_gossipsub::ConfigBuilder;
+    /// let mut config = ConfigBuilder::default();
+    /// config
+    ///     .max_transmit_size(1 << 20)
+    ///     .large_message_handling(true)
+    ///     .max_queued_fragments_per_peer(256);
+    /// assert_eq!(config.build().unwrap().max_queued_fragments_per_peer(), 256);
+    /// ```
+    pub fn max_queued_fragments_per_peer(
+        &mut self,
+        max_queued_fragments_per_peer: usize,
+    ) -> &mut Self {
+        self.config.max_queued_fragments_per_peer = max_queued_fragments_per_peer;
+        self
+    }
+
+    /// The maximum number of PREAMBLE announcements for transfers that have not
+    /// completed yet that are tracked per peer. The default is 16.
+    ///
+    /// ```rust
+    /// use libp2p_gossipsub::ConfigBuilder;
+    /// let mut config = ConfigBuilder::default();
+    /// config
+    ///     .max_transmit_size(1 << 20)
+    ///     .large_message_handling(true)
+    ///     .max_preamble_announcements_per_peer(32);
+    /// assert_eq!(
+    ///     config
+    ///         .build()
+    ///         .unwrap()
+    ///         .max_preamble_announcements_per_peer(),
+    ///     32
+    /// );
+    /// ```
+    pub fn max_preamble_announcements_per_peer(
+        &mut self,
+        max_preamble_announcements_per_peer: usize,
+    ) -> &mut Self {
+        self.config.max_preamble_announcements_per_peer = max_preamble_announcements_per_peer;
         self
     }
 
@@ -1162,7 +1503,63 @@ impl ConfigBuilder {
             return Err(ConfigBuilderError::InvalidProtocol);
         }
 
+        if self.config.large_message_handling {
+            self.validate_large_message_config()?;
+        }
+
         Ok(self.config.clone())
+    }
+
+    /// Validates the Large Message Handling parameters.
+    /// Only invoked when `large_message_handling` is enabled.
+    fn validate_large_message_config(&self) -> Result<(), ConfigBuilderError> {
+        let config = &self.config;
+        let max_transmit_size = config.max_transmit_size();
+        // A peer must be able to queue a whole message worth of fragments, or a
+        // large publish near a topic's transmit ceiling could never be sent.
+        let fragment_run_bytes = config
+            .max_queued_fragments_per_peer
+            .saturating_mul(config.fragment_size);
+        let queue_covers_every_ceiling = std::iter::once(max_transmit_size)
+            .chain(config.protocol.max_transmit_sizes.values().copied())
+            .all(|ceiling| fragment_run_bytes >= ceiling);
+
+        match () {
+            () if config.fragment_size < 1024 => {
+                Err(ConfigBuilderError::LargeMessageParametersInvalid)
+            }
+            () if config
+                .fragment_size
+                .saturating_add(LARGE_FRAGMENT_RPC_OVERHEAD)
+                > max_transmit_size =>
+            {
+                Err(ConfigBuilderError::FragmentSizeTooLarge)
+            }
+            () if config.fragmentation_threshold < config.fragment_size => {
+                Err(ConfigBuilderError::LargeMessageParametersInvalid)
+            }
+            () if config.max_pending_fragments == 0
+                || config.max_queued_fragments_per_peer == 0 =>
+            {
+                Err(ConfigBuilderError::LargeMessageParametersInvalid)
+            }
+            () if config.max_reassembly_bytes_total
+                < config
+                    .mesh_n_high()
+                    .saturating_mul(config.max_reassembly_bytes_per_peer) =>
+            {
+                Err(ConfigBuilderError::ReassemblyMemoryTooSmall)
+            }
+            () if !queue_covers_every_ceiling => {
+                Err(ConfigBuilderError::LargeMessageParametersInvalid)
+            }
+            // A spec-default sender fragments at 64KiB; this node must be able to
+            // receive such a fragment RPC.
+            () if max_transmit_size < 65536 + LARGE_FRAGMENT_RPC_OVERHEAD => {
+                Err(ConfigBuilderError::FragmentSizeTooLarge)
+            }
+            () => Ok(()),
+        }
     }
 }
 
@@ -1222,6 +1619,29 @@ impl std::fmt::Debug for Config {
         );
         let _ = builder.field("idontwant_on_publish", &self.idontwant_on_publish);
         let _ = builder.field("large_message_handling", &self.large_message_handling);
+        let _ = builder.field("fragment_size", &self.fragment_size);
+        let _ = builder.field("fragmentation_threshold", &self.fragmentation_threshold);
+        let _ = builder.field("preamble_threshold", &self.preamble_threshold);
+        let _ = builder.field("stagger_threshold", &self.stagger_threshold);
+        let _ = builder.field("stagger_interval", &self.stagger_interval);
+        let _ = builder.field("fragment_timeout", &self.fragment_timeout);
+        let _ = builder.field("max_pending_fragments", &self.max_pending_fragments);
+        let _ = builder.field(
+            "max_reassembly_bytes_per_peer",
+            &self.max_reassembly_bytes_per_peer,
+        );
+        let _ = builder.field(
+            "max_reassembly_bytes_total",
+            &self.max_reassembly_bytes_total,
+        );
+        let _ = builder.field(
+            "max_queued_fragments_per_peer",
+            &self.max_queued_fragments_per_peer,
+        );
+        let _ = builder.field(
+            "max_preamble_announcements_per_peer",
+            &self.max_preamble_announcements_per_peer,
+        );
         builder.finish()
     }
 }
@@ -1327,6 +1747,111 @@ mod test {
 
         assert_eq!(protocol_ids[0].protocol, "/purple");
         assert_eq!(protocol_ids[0].kind, PeerKind::Gossipsub);
+    }
+
+    #[test]
+    fn large_message_config_rejects_tiny_fragment_size() {
+        let result = ConfigBuilder::default()
+            .max_transmit_size(1 << 17)
+            .large_message_handling(true)
+            .fragment_size(512)
+            .build();
+        assert!(matches!(
+            result,
+            Err(ConfigBuilderError::LargeMessageParametersInvalid)
+        ));
+    }
+
+    #[test]
+    fn large_message_config_rejects_fragment_size_above_max_transmit_size() {
+        let result = ConfigBuilder::default()
+            .max_transmit_size(1 << 17)
+            .large_message_handling(true)
+            .fragment_size(131_000)
+            .fragmentation_threshold(131_072)
+            .build();
+        assert!(matches!(
+            result,
+            Err(ConfigBuilderError::FragmentSizeTooLarge)
+        ));
+    }
+
+    #[test]
+    fn large_message_config_rejects_fragmentation_threshold_below_fragment_size() {
+        let result = ConfigBuilder::default()
+            .max_transmit_size(1 << 17)
+            .large_message_handling(true)
+            .fragmentation_threshold(32_768)
+            .build();
+        assert!(matches!(
+            result,
+            Err(ConfigBuilderError::LargeMessageParametersInvalid)
+        ));
+    }
+
+    #[test]
+    fn large_message_config_rejects_zero_pending_fragments() {
+        let result = ConfigBuilder::default()
+            .max_transmit_size(1 << 17)
+            .large_message_handling(true)
+            .max_pending_fragments(0)
+            .build();
+        assert!(matches!(
+            result,
+            Err(ConfigBuilderError::LargeMessageParametersInvalid)
+        ));
+    }
+
+    #[test]
+    fn large_message_config_rejects_reassembly_memory_below_mesh_budget() {
+        let result = ConfigBuilder::default()
+            .max_transmit_size(1 << 17)
+            .large_message_handling(true)
+            .max_reassembly_bytes_total(1024 * 1024)
+            .build();
+        assert!(matches!(
+            result,
+            Err(ConfigBuilderError::ReassemblyMemoryTooSmall)
+        ));
+    }
+
+    #[test]
+    fn large_message_config_rejects_fragment_queue_below_max_transmit_size() {
+        let result = ConfigBuilder::default()
+            .max_transmit_size(1 << 17)
+            .large_message_handling(true)
+            .max_queued_fragments_per_peer(1)
+            .build();
+        assert!(matches!(
+            result,
+            Err(ConfigBuilderError::LargeMessageParametersInvalid)
+        ));
+    }
+
+    #[test]
+    fn large_message_config_rejects_fragment_queue_below_topic_transmit_size() {
+        let result = ConfigBuilder::default()
+            .max_transmit_size(1 << 17)
+            .large_message_handling(true)
+            .max_transmit_size_for_topic(16 * 1024 * 1024, TopicHash::from_raw("giant"))
+            .build();
+        assert!(matches!(
+            result,
+            Err(ConfigBuilderError::LargeMessageParametersInvalid)
+        ));
+    }
+
+    #[test]
+    fn large_message_config_rejects_default_max_transmit_size() {
+        // A spec-default sender fragments at 64KiB, which does not fit the
+        // default 64KiB max_transmit_size once RPC overhead is added.
+        let result = ConfigBuilder::default()
+            .large_message_handling(true)
+            .build();
+        assert!(matches!(
+            result,
+            Err(ConfigBuilderError::FragmentSizeTooLarge)
+        ));
     }
 
     fn get_gossipsub_message() -> Message {

@@ -237,7 +237,10 @@ fn test_join() {
             &address,
         )
         .unwrap();
-        let queue = Queue::new(gs.config.connection_handler_queue_len());
+        let queue = Queue::new(
+            gs.config.connection_handler_queue_len(),
+            gs.config.max_queued_fragments_per_peer(),
+        );
         let receiver_queue = queue.clone();
         let connection_id = ConnectionId::new_unchecked(0);
         gs.connected_peers.insert(
@@ -250,6 +253,8 @@ fn test_join() {
                 topics: Default::default(),
                 messages: queue,
                 dont_send: LinkedHashMap::new(),
+                imreceiving: LinkedHashMap::new(),
+                fragments_relayed: LinkedHashMap::new(),
             },
         );
         queues.insert(random_peer, receiver_queue);

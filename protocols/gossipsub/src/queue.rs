@@ -29,17 +29,39 @@ use crate::{MessageId, types::RpcOut};
 
 const CONTROL_MSGS_LIMIT: usize = 20_000;
 
+/// The data tier `poll_pop` drains next, so that queued large message
+/// fragments and other low priority messages progress in round-robin
+/// and neither starves the other.
+#[derive(Debug, Clone, Copy)]
+enum DataTier {
+    NonPriority,
+    Fragments,
+}
+
+impl DataTier {
+    fn flip(self) -> Self {
+        match self {
+            DataTier::NonPriority => DataTier::Fragments,
+            DataTier::Fragments => DataTier::NonPriority,
+        }
+    }
+}
+
 /// An async priority queue used to dispatch messages from the `NetworkBehaviour`
 /// Provides a clean abstraction over high-priority (unbounded), control (bounded),
-/// and non priority (bounded) message queues.
+/// non priority (bounded) and large message fragment (bounded) message queues.
 #[derive(Debug)]
 pub(crate) struct Queue {
     /// High-priority unbounded queue (Subscribe, Unsubscribe)
     pub(crate) priority: Shared,
-    /// Control messages bounded queue (Graft, Prune, IDontWant)
+    /// Control messages bounded queue (Graft, Prune, IDontWant, Preamble, ImReceiving)
     pub(crate) control: Shared,
     /// Low-priority bounded queue (Publish, Forward, IHave, IWant)
     pub(crate) non_priority: Shared,
+    /// Large message fragments bounded queue (LargeMessageFragment)
+    pub(crate) fragments: Shared,
+    /// The data tier to drain next.
+    next_data_tier: DataTier,
     /// The id of the current reference of the counter.
     pub(crate) id: usize,
     /// The total number of references for the queue.
@@ -47,12 +69,15 @@ pub(crate) struct Queue {
 }
 
 impl Queue {
-    /// Create a new `Queue` with `capacity`.
-    pub(crate) fn new(capacity: usize) -> Self {
+    /// Create a new `Queue` with `capacity` for non priority messages and
+    /// `fragment_capacity` for large message fragments.
+    pub(crate) fn new(capacity: usize, fragment_capacity: usize) -> Self {
         Self {
             priority: Shared::new(),
             control: Shared::with_capacity(CONTROL_MSGS_LIMIT),
             non_priority: Shared::with_capacity(capacity),
+            fragments: Shared::with_capacity(fragment_capacity),
+            next_data_tier: DataTier::NonPriority,
             id: 1,
             count: Arc::new(AtomicUsize::new(1)),
         }
@@ -71,9 +96,12 @@ impl Queue {
                     .expect("Shared is unbounded");
                 Ok(())
             }
-            RpcOut::Graft(_) | RpcOut::Prune(_) | RpcOut::IDontWant(_) => {
-                self.control.try_push(message)
-            }
+            RpcOut::Graft(_)
+            | RpcOut::Prune(_)
+            | RpcOut::IDontWant(_)
+            | RpcOut::Preamble(_)
+            | RpcOut::ImReceiving(_) => self.control.try_push(message),
+            RpcOut::LargeMessageFragment { .. } => self.fragments.try_push(message),
             RpcOut::Publish { .. }
             | RpcOut::IHave(_)
             | RpcOut::TestExtension
@@ -98,6 +126,16 @@ impl Queue {
             }
             _ => true,
         });
+        self.fragments.retain(|message| {
+            if let RpcOut::LargeMessageFragment { fragment, .. } = message
+                && message_ids.contains(&fragment.message_id)
+            {
+                count += 1;
+                false
+            } else {
+                true
+            }
+        });
         count
     }
 
@@ -113,29 +151,42 @@ impl Queue {
             return Poll::Ready(rpc);
         }
 
-        // Finally we try the non priority messages
-        if let Poll::Ready(rpc) = Pin::new(&mut self.non_priority).poll_pop(cx) {
-            return Poll::Ready(rpc);
-        }
+        // Finally we drain the two data tiers round-robin so that queued
+        // large message fragments and other low priority messages
+        // never starve each other.
+        let (first, second) = match self.next_data_tier {
+            DataTier::NonPriority => (&mut self.non_priority, &mut self.fragments),
+            DataTier::Fragments => (&mut self.fragments, &mut self.non_priority),
+        };
 
-        Poll::Pending
+        match Pin::new(first).poll_pop(cx) {
+            Poll::Ready(rpc) => {
+                self.next_data_tier = self.next_data_tier.flip();
+                Poll::Ready(rpc)
+            }
+            Poll::Pending => match Pin::new(second).poll_pop(cx) {
+                Poll::Ready(rpc) => {
+                    self.next_data_tier = self.next_data_tier.flip();
+                    Poll::Ready(rpc)
+                }
+                Poll::Pending => Poll::Pending,
+            },
+        }
     }
 
     /// Check if the queue is empty.
     pub(crate) fn is_empty(&self) -> bool {
-        if !self.priority.is_empty() {
-            return false;
-        }
+        self.priority.is_empty()
+            && self.control.is_empty()
+            && self.non_priority.is_empty()
+            && self.fragments.is_empty()
+    }
 
-        if !self.control.is_empty() {
-            return false;
-        }
-
-        if !self.non_priority.is_empty() {
-            return false;
-        }
-
-        true
+    /// Returns how many more large message fragments the fragments tier can accept.
+    /// Callers check this before queueing the fragments of a message so that a
+    /// partial run of fragments is never queued.
+    pub(crate) fn fragments_remaining_capacity(&self) -> usize {
+        self.fragments.remaining_capacity()
     }
 
     /// Returns the length of the priority queue.
@@ -147,7 +198,7 @@ impl Queue {
     /// Returns the length of the non priority queue.
     #[cfg(feature = "metrics")]
     pub(crate) fn non_priority_len(&self) -> usize {
-        self.non_priority.len()
+        self.non_priority.len() + self.fragments.len()
     }
 
     /// Attempts to pop a message from the queue.
@@ -159,8 +210,10 @@ impl Queue {
             .try_pop()
             // Then control messages
             .or_else(|| self.control.try_pop())
-            // Finally non priority
+            // Then non priority
             .or_else(|| self.non_priority.try_pop())
+            // Finally large message fragments
+            .or_else(|| self.fragments.try_pop())
     }
 }
 
@@ -183,6 +236,12 @@ impl Clone for Queue {
                 capacity: self.non_priority.capacity,
                 id: new_id,
             },
+            fragments: Shared {
+                inner: self.fragments.inner.clone(),
+                capacity: self.fragments.capacity,
+                id: new_id,
+            },
+            next_data_tier: self.next_data_tier,
             id: self.id,
             count: self.count.clone(),
         }
@@ -275,6 +334,15 @@ impl Shared {
         guard.queue.len()
     }
 
+    /// Returns how many more messages the queue can accept,
+    /// `usize::MAX` if the queue is unbounded.
+    pub(crate) fn remaining_capacity(&self) -> usize {
+        let guard = self.inner.lock().expect("lock to not be poisoned");
+        self.capacity.map_or(usize::MAX, |capacity| {
+            capacity.saturating_sub(guard.queue.len())
+        })
+    }
+
     /// Attempts to pop an message from the queue.
     /// returns None if the queue is empty.
     #[cfg(test)]
@@ -296,4 +364,156 @@ impl Drop for Shared {
 struct SharedInner {
     queue: VecDeque<RpcOut>,
     pending_pops: HashMap<usize, Waker>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures::task::noop_waker_ref;
+    use futures_timer::Delay;
+
+    use super::*;
+    use crate::{
+        TopicHash,
+        types::{LargeMessageFragment, RawMessage},
+    };
+
+    fn fragment_rpc(id: u8, index: u32) -> RpcOut {
+        RpcOut::LargeMessageFragment {
+            fragment: LargeMessageFragment {
+                message_id: MessageId::new(&[id]),
+                fragment_index: index,
+                total_fragments: 8,
+                fragment_data: vec![0u8; 8],
+                topic_hash: TopicHash::from_raw("topic"),
+            },
+            timeout: Delay::new(Duration::from_secs(5)),
+        }
+    }
+
+    fn publish_rpc(id: u8) -> RpcOut {
+        RpcOut::Publish {
+            message_id: MessageId::new(&[id]),
+            message: RawMessage {
+                source: None,
+                data: vec![id],
+                sequence_number: None,
+                topic: TopicHash::from_raw("topic"),
+                signature: None,
+                key: None,
+                validated: false,
+            },
+            timeout: Delay::new(Duration::from_secs(5)),
+        }
+    }
+
+    #[test]
+    fn test_fragment_routes_to_fragment_tier() {
+        let mut queue = Queue::new(8, 8);
+        queue.try_push(fragment_rpc(1, 0)).unwrap();
+        assert!(queue.non_priority.is_empty());
+        assert!(!queue.fragments.is_empty());
+    }
+
+    #[test]
+    fn test_fragment_tier_is_bounded() {
+        let mut queue = Queue::new(8, 2);
+        queue.try_push(fragment_rpc(1, 0)).unwrap();
+        queue.try_push(fragment_rpc(1, 1)).unwrap();
+        assert!(queue.try_push(fragment_rpc(1, 2)).is_err());
+    }
+
+    #[test]
+    fn test_remove_data_messages_purges_queued_fragments() {
+        let mut queue = Queue::new(8, 8);
+        queue.try_push(fragment_rpc(1, 0)).unwrap();
+        queue.try_push(fragment_rpc(1, 1)).unwrap();
+        queue.try_push(fragment_rpc(2, 0)).unwrap();
+        let removed = queue.remove_data_messages(&[MessageId::new(&[1])]);
+        assert_eq!(removed, 2);
+        assert!(matches!(
+            queue.try_pop(),
+            Some(RpcOut::LargeMessageFragment { fragment, .. })
+                if fragment.message_id == MessageId::new(&[2])
+        ));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_poll_pop_alternates_between_fragments_and_non_priority() {
+        let mut queue = Queue::new(8, 8);
+        queue.try_push(publish_rpc(1)).unwrap();
+        queue.try_push(publish_rpc(2)).unwrap();
+        queue.try_push(fragment_rpc(3, 0)).unwrap();
+        queue.try_push(fragment_rpc(3, 1)).unwrap();
+
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(matches!(
+            queue.poll_pop(&mut cx),
+            Poll::Ready(RpcOut::Publish { .. })
+        ));
+        assert!(matches!(
+            queue.poll_pop(&mut cx),
+            Poll::Ready(RpcOut::LargeMessageFragment { .. })
+        ));
+        assert!(matches!(
+            queue.poll_pop(&mut cx),
+            Poll::Ready(RpcOut::Publish { .. })
+        ));
+        assert!(matches!(
+            queue.poll_pop(&mut cx),
+            Poll::Ready(RpcOut::LargeMessageFragment { .. })
+        ));
+        assert!(queue.poll_pop(&mut cx).is_pending());
+    }
+
+    #[test]
+    fn test_fragments_do_not_starve_non_priority() {
+        let mut queue = Queue::new(8, 8);
+        (0..6u32).for_each(|i| queue.try_push(fragment_rpc(1, i)).unwrap());
+        queue.try_push(publish_rpc(2)).unwrap();
+
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let first = queue.poll_pop(&mut cx);
+        let second = queue.poll_pop(&mut cx);
+        assert!(
+            matches!(first, Poll::Ready(RpcOut::Publish { .. }))
+                || matches!(second, Poll::Ready(RpcOut::Publish { .. })),
+            "a publish message should pop within two polls"
+        );
+    }
+
+    #[test]
+    fn test_is_empty_is_false_with_only_queued_fragments() {
+        let mut queue = Queue::new(8, 8);
+        assert!(queue.is_empty());
+        queue.try_push(fragment_rpc(1, 0)).unwrap();
+        assert!(!queue.is_empty());
+    }
+
+    #[test]
+    fn test_fragments_remaining_capacity_tracks_pushes_and_pops() {
+        let mut queue = Queue::new(8, 2);
+        assert_eq!(queue.fragments_remaining_capacity(), 2);
+        queue.try_push(fragment_rpc(1, 0)).unwrap();
+        assert_eq!(queue.fragments_remaining_capacity(), 1);
+        queue.try_push(fragment_rpc(1, 1)).unwrap();
+        assert_eq!(queue.fragments_remaining_capacity(), 0);
+        queue.try_pop().unwrap();
+        assert_eq!(queue.fragments_remaining_capacity(), 1);
+    }
+
+    #[test]
+    fn test_queue_clone_shares_fragment_tier() {
+        let mut queue = Queue::new(8, 8);
+        let mut clone = queue.clone();
+        queue.try_push(fragment_rpc(1, 0)).unwrap();
+        assert!(!clone.fragments.is_empty());
+        assert!(matches!(
+            clone.try_pop(),
+            Some(RpcOut::LargeMessageFragment { .. })
+        ));
+        assert!(queue.is_empty());
+    }
 }

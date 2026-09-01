@@ -204,6 +204,36 @@ pub(crate) struct Metrics {
     /// The number of messages we have removed from a queue that we would otherwise send. A rough
     /// guide to measure of bandwidth saved.
     removed_queued_messages: Counter,
+
+    // Large Message Handling extension metrics
+    /// The number of large-message fragments sent, including relayed fragments.
+    fragments_sent: Counter,
+    /// The number of large-message fragments received.
+    fragments_received: Counter,
+    /// The number of large-message fragments relayed onward before reassembly completed.
+    fragments_relayed: Counter,
+    /// The number of received large-message fragments dropped, per reason.
+    fragments_dropped: Family<FragmentDropLabel, Counter>,
+    /// The number of large-message reassemblies started.
+    reassemblies_started: Counter,
+    /// The number of large-message reassemblies completed.
+    reassemblies_completed: Counter,
+    /// The number of large-message reassemblies dropped by the timeout sweep.
+    reassemblies_timed_out: Counter,
+    /// The number of bytes currently buffered for large-message reassembly.
+    reassembly_bytes_in_use: Gauge,
+    /// The number of PREAMBLE control messages sent.
+    preambles_sent: Counter,
+    /// The number of PREAMBLE control messages received.
+    preambles_received: Counter,
+    /// The number of IMRECEIVING control messages sent.
+    imreceiving_sent: Counter,
+    /// The number of IMRECEIVING control messages received.
+    imreceiving_received: Counter,
+    /// The number of staggered sends currently queued.
+    stagger_sends_in_flight: Gauge,
+    /// The number of staggered sends suppressed at dispatch time, per reason.
+    stagger_peers_skipped: Family<StaggerSkipLabel, Counter>,
 }
 
 impl Metrics {
@@ -409,6 +439,77 @@ impl Metrics {
             metric
         };
 
+        macro_rules! register_counter {
+            ($name:expr, $help:expr) => {{
+                let metric = Counter::default();
+                registry.register($name, $help, metric.clone());
+                metric
+            }};
+        }
+
+        macro_rules! register_gauge {
+            ($name:expr, $help:expr) => {{
+                let metric = Gauge::default();
+                registry.register($name, $help, metric.clone());
+                metric
+            }};
+        }
+
+        let fragments_sent = register_counter!(
+            "fragments_sent",
+            "Number of large message fragments sent, including relayed fragments"
+        );
+        let fragments_received = register_counter!(
+            "fragments_received",
+            "Number of large message fragments received"
+        );
+        let fragments_relayed = register_counter!(
+            "fragments_relayed",
+            "Number of large message fragments relayed onward before reassembly completed"
+        );
+        let fragments_dropped = register_family!(
+            "fragments_dropped",
+            "Number of received large message fragments dropped, per reason"
+        );
+        let reassemblies_started = register_counter!(
+            "reassemblies_started",
+            "Number of large message reassemblies started"
+        );
+        let reassemblies_completed = register_counter!(
+            "reassemblies_completed",
+            "Number of large message reassemblies completed"
+        );
+        let reassemblies_timed_out = register_counter!(
+            "reassemblies_timed_out",
+            "Number of large message reassemblies dropped by the timeout sweep"
+        );
+        let reassembly_bytes_in_use = register_gauge!(
+            "reassembly_bytes_in_use",
+            "Bytes currently buffered for large message reassembly"
+        );
+        let preambles_sent =
+            register_counter!("preambles_sent", "Number of PREAMBLE control messages sent");
+        let preambles_received = register_counter!(
+            "preambles_received",
+            "Number of PREAMBLE control messages received"
+        );
+        let imreceiving_sent = register_counter!(
+            "imreceiving_sent",
+            "Number of IMRECEIVING control messages sent"
+        );
+        let imreceiving_received = register_counter!(
+            "imreceiving_received",
+            "Number of IMRECEIVING control messages received"
+        );
+        let stagger_sends_in_flight = register_gauge!(
+            "stagger_sends_in_flight",
+            "Number of staggered sends currently queued"
+        );
+        let stagger_peers_skipped = register_family!(
+            "stagger_peers_skipped",
+            "Number of staggered sends suppressed at dispatch time, per reason"
+        );
+
         Self {
             max_topics,
             max_never_subscribed_topics,
@@ -443,6 +544,20 @@ impl Metrics {
             queue_size,
             failed_messages,
             removed_queued_messages,
+            fragments_sent,
+            fragments_received,
+            fragments_relayed,
+            fragments_dropped,
+            reassemblies_started,
+            reassemblies_completed,
+            reassemblies_timed_out,
+            reassembly_bytes_in_use,
+            preambles_sent,
+            preambles_received,
+            imreceiving_sent,
+            imreceiving_received,
+            stagger_sends_in_flight,
+            stagger_peers_skipped,
         }
     }
 
@@ -755,6 +870,80 @@ impl Metrics {
     pub(crate) fn register_removed_messages(&mut self, removed_messages: usize) {
         self.removed_queued_messages.inc_by(removed_messages as u64);
     }
+
+    /// Register that a large-message fragment was sent.
+    pub(crate) fn register_fragment_sent(&mut self) {
+        self.fragments_sent.inc();
+    }
+
+    /// Register received large-message fragments.
+    pub(crate) fn register_fragments_received(&mut self, count: usize) {
+        self.fragments_received.inc_by(count as u64);
+    }
+
+    /// Register that a large-message fragment was relayed before reassembly.
+    pub(crate) fn register_fragment_relayed(&mut self) {
+        self.fragments_relayed.inc();
+    }
+
+    /// Register received large-message fragments dropped for `reason`.
+    pub(crate) fn register_fragments_dropped(&mut self, reason: FragmentDrop, count: usize) {
+        self.fragments_dropped
+            .get_or_create(&FragmentDropLabel { reason })
+            .inc_by(count as u64);
+    }
+
+    /// Register that a large-message reassembly was started.
+    pub(crate) fn register_reassembly_started(&mut self) {
+        self.reassemblies_started.inc();
+    }
+
+    /// Register that a large-message reassembly completed.
+    pub(crate) fn register_reassembly_completed(&mut self) {
+        self.reassemblies_completed.inc();
+    }
+
+    /// Register large-message reassemblies dropped by the timeout sweep.
+    pub(crate) fn register_reassemblies_timed_out(&mut self, count: usize) {
+        self.reassemblies_timed_out.inc_by(count as u64);
+    }
+
+    /// Record the bytes currently buffered for large-message reassembly.
+    pub(crate) fn set_reassembly_bytes_in_use(&mut self, bytes: usize) {
+        self.reassembly_bytes_in_use.set(bytes as i64);
+    }
+
+    /// Register that a PREAMBLE control message was sent.
+    pub(crate) fn register_preamble_sent(&mut self) {
+        self.preambles_sent.inc();
+    }
+
+    /// Register that a PREAMBLE control message was received.
+    pub(crate) fn register_preamble_received(&mut self) {
+        self.preambles_received.inc();
+    }
+
+    /// Register that an IMRECEIVING control message was sent.
+    pub(crate) fn register_imreceiving_sent(&mut self) {
+        self.imreceiving_sent.inc();
+    }
+
+    /// Register that an IMRECEIVING control message was received.
+    pub(crate) fn register_imreceiving_received(&mut self) {
+        self.imreceiving_received.inc();
+    }
+
+    /// Record the number of staggered sends currently queued.
+    pub(crate) fn set_stagger_sends_in_flight(&mut self, queued: usize) {
+        self.stagger_sends_in_flight.set(queued as i64);
+    }
+
+    /// Register that a staggered send was suppressed at dispatch time.
+    pub(crate) fn register_stagger_peer_skipped(&mut self, reason: StaggerSkip) {
+        self.stagger_peers_skipped
+            .get_or_create(&StaggerSkipLabel { reason })
+            .inc();
+    }
 }
 
 /// Reasons why a peer was included in the mesh.
@@ -837,6 +1026,46 @@ struct PenaltyLabel {
 #[derive(PartialEq, Eq, Hash, EncodeLabelSet, Clone, Debug)]
 struct MessageTypeLabel {
     message_type: MessageType,
+}
+
+/// Reasons a received large-message fragment was dropped by the behaviour.
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, EncodeLabelValue)]
+pub(crate) enum FragmentDrop {
+    /// The Large Message Handling extension is disabled locally.
+    Disabled,
+    /// The sender's score is below the graylist threshold.
+    BelowThreshold,
+    /// The whole message is already in the duplicate cache.
+    Duplicate,
+    /// The fragments failed an admission check or reassembled into an invalid message.
+    Invalid,
+}
+
+/// Label for the reason a received large-message fragment was dropped.
+#[derive(PartialEq, Eq, Hash, EncodeLabelSet, Clone, Debug)]
+struct FragmentDropLabel {
+    reason: FragmentDrop,
+}
+
+/// Reasons a staggered send was suppressed at dispatch time.
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug, EncodeLabelValue)]
+pub(crate) enum StaggerSkip {
+    /// The peer disconnected during the stagger window.
+    Disconnected,
+    /// The peer sent IDONTWANT for the message during the stagger window.
+    Idontwant,
+    /// The peer sent IMRECEIVING for the message during the stagger window.
+    Imreceiving,
+    /// The peer left the topic mesh during the stagger window.
+    LeftMesh,
+    /// The peer stopped advertising the Large Message Handling extension.
+    ExtensionLost,
+}
+
+/// Label for the reason a staggered send was suppressed.
+#[derive(PartialEq, Eq, Hash, EncodeLabelSet, Clone, Debug)]
+struct StaggerSkipLabel {
+    reason: StaggerSkip,
 }
 
 #[derive(Clone)]

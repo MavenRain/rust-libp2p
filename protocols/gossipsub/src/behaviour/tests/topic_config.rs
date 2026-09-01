@@ -599,6 +599,38 @@ fn test_publish_large_message_with_specific_transmit_size_config() {
 }
 
 #[test]
+fn test_publish_large_message_with_large_message_handling_config() {
+    let topic = Topic::new("test");
+    let topic_hash = topic.hash();
+
+    // Large Message Handling raises no transmit ceiling: an oversized publish
+    // fails exactly as it does without the extension.
+    let max_topic_transmit_size = 2048;
+    let config = ConfigBuilder::default()
+        .max_transmit_size(1 << 17)
+        .large_message_handling(true)
+        .max_transmit_size_for_topic(max_topic_transmit_size, topic_hash.clone())
+        .validation_mode(ValidationMode::Strict)
+        .build()
+        .unwrap();
+
+    let (mut gs, _, _, _) = DefaultBehaviourTestBuilder::default()
+        .peer_no(10)
+        .topics(vec!["test".to_string()])
+        .to_subscribe(true)
+        .gs_config(config)
+        .create_network();
+
+    let data = vec![0; 2049];
+
+    let result = gs.publish(topic.clone(), data);
+    assert!(
+        matches!(result, Err(PublishError::MessageTooLarge)),
+        "Expected MessageTooLarge error with large message handling enabled"
+    );
+}
+
+#[test]
 fn test_validation_error_message_size_too_large_topic_specific() {
     let topic = Topic::new("test");
     let topic_hash = topic.hash();
@@ -670,6 +702,7 @@ fn test_validation_error_message_size_too_large_topic_specific() {
         Config::default_max_transmit_size() * 2,
         ValidationMode::None,
         max_transmit_size_map,
+        5000,
         5000,
         5000,
     );
@@ -781,6 +814,7 @@ fn test_validation_message_size_within_topic_specific() {
         Config::default_max_transmit_size() * 2,
         ValidationMode::None,
         max_transmit_size_map,
+        5000,
         5000,
         5000,
     );
